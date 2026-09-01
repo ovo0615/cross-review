@@ -14,6 +14,7 @@ import shutil
 import socket
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -51,7 +52,7 @@ def url_is_allowed(url: str, cfg: dict) -> str:
     scheme = (parsed.scheme or "").lower()
 
     if scheme == "file":
-        if not cfg.get("allow_file_urls", False):
+        if not as_bool(cfg.get("allow_file_urls"), False):
             return "拒絕 file:// 網址（要允許請在設定裡把 allow_file_urls 設為 true）"
         return "" if Path(parsed.path.lstrip("/")).exists() else "檔案不存在"
 
@@ -59,7 +60,7 @@ def url_is_allowed(url: str, cfg: dict) -> str:
         return "只接受 http(s) 網址，收到的是 " + (scheme or "（沒有 scheme）")
 
     host = (parsed.hostname or "").lower()
-    if host not in LOCAL_HOSTS and not cfg.get("allow_remote_urls", False):
+    if host not in LOCAL_HOSTS and not as_bool(cfg.get("allow_remote_urls"), False):
         return ("拒絕非本機網址 " + host
                 + "（要允許請在設定裡把 allow_remote_urls 設為 true）")
     return ""
@@ -78,7 +79,33 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
             newurl, code, "redirect:" + str(newurl), headers, fp)
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+# ProxyHandler({}) 明確關掉所有 proxy。預設的 opener 會沿用系統的
+# HTTP_PROXY／HTTPS_PROXY，機器上設了而沒排除 localhost 時，
+# 這個「本機頁面就緒了嗎」的探測請求（含路徑與查詢字串）會經過外部 proxy——
+# 那既是外洩，也跟 Chrome 那邊「非本機一律走死 proxy」的政策自相矛盾。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def as_bool(value, default: bool = False) -> bool:
+    """安全旗標只接受真正的布林語意，不用 truthiness。
+
+    設定檔寫成字串 "false" 時，truthiness 判斷會當成 true——
+    邊界就被靜默打開了，而使用者以為自己關著。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off", ""):
+            return False
+        return default          # 看不懂的字串一律用預設（也就是比較安全的那邊）
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
 
 
 def page_is_ready(url: str, timeout: float = 5.0) -> str:
@@ -133,13 +160,16 @@ def unique_base(base: str, taken: set) -> str:
     if base not in taken:
         taken.add(base)
         return base
-    for i in range(2, 100):
+    for i in range(2, 1000):
         candidate = base + "-" + str(i)
         if candidate not in taken:
             taken.add(candidate)
             return candidate
-    taken.add(base)
-    return base
+    # 真的撞到一千次的話，用一個保證唯一的後綴，絕不回傳已用過的名字——
+    # 那會覆寫別人的截圖與基準圖，而且完全沒有訊息。
+    candidate = base + "-" + uuid.uuid4().hex[:8]
+    taken.add(candidate)
+    return candidate
 
 
 # ---------------------------------------------------------------- 互動
@@ -376,7 +406,7 @@ def collect(project: Path, cfg: dict) -> dict:
         try:
             # 沒有明確開放遠端網址時，讓 Chrome 從一開始就連不出去。
             browser = Browser(chrome, width, height,
-                              local_only=not cfg.get("allow_remote_urls", False))
+                              local_only=not as_bool(cfg.get("allow_remote_urls"), False))
             for shot in group:
                 # 每個畫面各自包起來。原本只有群組層級的 try，
                 # 一個網址導覽失敗就會中止同尺寸的其餘畫面，

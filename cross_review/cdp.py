@@ -22,6 +22,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -296,10 +297,25 @@ class Browser:
             except Exception:
                 try:
                     self.proc.kill()
+                    # kill() 之後一定要再等。不等的話行程可能還握著 profile
+                    # 裡的檔案，接下來的 rmtree 會失敗，而 ignore_errors=True
+                    # 把失敗吞掉——暫存目錄就這樣一次一次累積下來。
+                    self.proc.wait(timeout=10)
                 except Exception:
                     pass
             self.proc = None
-        shutil.rmtree(self.profile, ignore_errors=True)
+
+        # Chrome 會生一堆子行程。主行程結束後它們可能還在收尾，
+        # 所以 rmtree 要retry，不能一次失敗就靜默放棄。
+        for attempt in range(5):
+            shutil.rmtree(self.profile, ignore_errors=True)
+            if not self.profile.exists():
+                return
+            time.sleep(0.4 * (attempt + 1))
+        if self.profile.exists():
+            # 真的刪不掉就講出來，不要無聲留下垃圾。
+            sys.stderr.write("cross-review：暫存 profile 刪不掉，請手動清除 "
+                             + str(self.profile) + "\n")
 
     def __enter__(self):
         return self

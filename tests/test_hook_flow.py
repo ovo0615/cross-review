@@ -355,6 +355,50 @@ def scenario_boundaries(base: Path) -> None:
                   if ("[::1]" if h == "::1" else h) not in bypass]
     check("每個本機主機都在 proxy bypass 清單裡", not mismatched, str(mismatched))
 
+    # 安全旗標不能用 truthiness：字串 "false" 是 truthy，
+    # 邊界會被靜默打開而使用者以為自己關著。
+    from cross_review.shots import as_bool
+    for bad in ("false", "False", "no", "off", "0", ""):
+        check("字串 " + repr(bad) + " 不會被當成 true",
+              as_bool(bad, False) is False, repr(as_bool(bad, False)))
+    for good in ("true", "True", "yes", "on", "1"):
+        check("字串 " + repr(good) + " 會被當成 true", as_bool(good, False) is True)
+    check("看不懂的字串用預設（安全的那邊）", as_bool("maybe", False) is False)
+    check("allow_remote_urls 寫成字串 false 時仍然拒絕遠端",
+          bool(url_is_allowed("http://10.0.0.5/", {"allow_remote_urls": "false"})))
+    check("allow_file_urls 寫成字串 false 時仍然拒絕 file://",
+          bool(url_is_allowed("file:///C:/x.txt", {"allow_file_urls": "false"})))
+
+    # 探測請求不能走系統 proxy——那會把本機網址（含路徑與查詢字串）送出去。
+    # 跟預設 opener 對比才與環境無關：預設的一定帶 ProxyHandler（讀環境變數），
+    # 我們的因為傳了 ProxyHandler({}) 而完全不註冊 proxy 處理。
+    # 這台機器沒設 proxy，所以直接比對 handler 清單看不出差異——
+    # 必須在「有 proxy 的環境」下才測得到。臨時塞一個假的環境變數。
+    import urllib.request as _ur
+    from cross_review.shots import _NoRedirect
+    saved = os.environ.get("HTTP_PROXY")
+    os.environ["HTTP_PROXY"] = "http://proxy.invalid:8080"
+    try:
+        default_names = [type(h).__name__ for h in _ur.build_opener().handlers]
+        ours_names = [type(h).__name__ for h in _ur.build_opener(
+            _ur.ProxyHandler({}), _NoRedirect).handlers]
+    finally:
+        if saved is None:
+            os.environ.pop("HTTP_PROXY", None)
+        else:
+            os.environ["HTTP_PROXY"] = saved
+    check("有 proxy 環境時，預設 opener 會帶 ProxyHandler",
+          "ProxyHandler" in default_names, str(default_names))
+    check("有 proxy 環境時，我們的 opener 仍然不帶 proxy 處理",
+          "ProxyHandler" not in ours_names, str(ours_names))
+
+    # 撞名一千次之後也不能回傳已用過的名字（那會覆寫別人的基準圖）。
+    from cross_review.shots import unique_base
+    taken = set()
+    names = [unique_base("same", taken) for _ in range(1200)]
+    check("撞名一千次以上仍然不會重複", len(set(names)) == len(names),
+          str(len(names) - len(set(names))) + " 個重複")
+
     # Browser 建構失敗時不能留下暫存 profile 與孤兒行程。
     import tempfile as _tf
     from cross_review.cdp import Browser as _Browser
