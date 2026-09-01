@@ -229,13 +229,20 @@ def build_code_dossier(project: Path, job: dict, cfg: dict) -> tuple:
     # 於是一個沒有產生報告的回合被當成完成——安全修正造出了新的假完成路徑。
     rejected = [f for f in all_pinned if f not in pinned]
     files = [f for f in pinned if Path(f).exists()]
+
+    # 被過濾掉的刪除項也要記進 rejected。只記 files 的話，
+    # 工作單若只含這種刪除項，files 與 deleted 都會是空的、rejected 也是空的，
+    # run_code 於是回報「沒有改動」並寫 .done——又一條假完成路徑。
+    all_deleted = list(job.get("deleted") or [])
+    kept_deleted = [f for f in all_deleted
+                    if common.is_inside(str(f), project)
+                    and common.is_code_file(str(f))]
+    rejected += [f for f in all_deleted if f not in kept_deleted]
     # 釘住之後才消失的檔案要講出來，不能靜默從材料裡蒸發。
     vanished = [f for f in pinned if not Path(f).exists()]
     # deleted 也要過濾。上一輪只為 files 加了越界檢查就收工，
     # 而 deleted 一樣會被送進 git_diff——同一件事又只做了一半。
-    deleted = [f for f in (job.get("deleted") or [])
-               if common.is_inside(str(f), project)
-               and common.is_code_file(str(f))] + vanished
+    deleted = kept_deleted + vanished
     source = job.get("source") or "工作單（hook 在回合結束當下釘住的清單）"
 
     max_files = common.positive_int(cfg, "max_files")

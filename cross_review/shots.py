@@ -235,7 +235,7 @@ def apply_action(browser: Browser, action: dict) -> str:
 
 
 def run_shot(browser: Browser, shot: dict, current_dir: Path, baseline_dir: Path,
-             taken: set, cfg: dict) -> tuple:
+             taken: set, cfg: dict, project: Path) -> tuple:
     """跑完一個畫面的所有步驟，回傳 (擷取清單, 錯誤清單)。"""
     name = str(shot.get("name") or "shot")
     url = str(shot.get("url"))
@@ -251,6 +251,9 @@ def run_shot(browser: Browser, shot: dict, current_dir: Path, baseline_dir: Path
     except Exception:
         landed = ""
     if landed:
+        # 第二道防線。第一道是行程層級的：Chrome 啟動時就被切斷對外的路，
+        # 所以外連在發出去之前就失敗了。這裡再確認一次落點，
+        # 涵蓋不需要對外連線的轉向（例如同源的 history.pushState）。
         denied = url_is_allowed(landed, cfg)
         if denied:
             return [], [name + "：載入後停在 " + landed + " — " + denied]
@@ -265,6 +268,15 @@ def run_shot(browser: Browser, shot: dict, current_dir: Path, baseline_dir: Path
             base = unique_base(safe_name(name) + "__" + safe_name(step), taken)
             png = current_dir / (base + ".png")
             baseline = baseline_dir / (base + ".png")
+
+            # 個別的 PNG 路徑也要驗證，不能只驗證上層目錄。
+            # 預先放一個指向專案外的檔案連結，截圖就會寫過去，
+            # 而 baseline 那一條更糟——外部檔案會被當成基準圖送進審查。
+            if not (common.review_child_is_safe(project, "shots", base + ".png")
+                    and common.review_child_is_safe(project, "baseline", base + ".png")):
+                errors.append(name + " / " + step
+                              + "：截圖路徑指向專案外部，拒絕寫入也拒絕讀取。")
+                continue
 
             had_baseline = False
             if png.exists():
@@ -356,14 +368,16 @@ def collect(project: Path, cfg: dict) -> dict:
     for (width, height), group in groups.items():
         browser = None
         try:
-            browser = Browser(chrome, width, height)
+            # 沒有明確開放遠端網址時，讓 Chrome 從一開始就連不出去。
+            browser = Browser(chrome, width, height,
+                              local_only=not cfg.get("allow_remote_urls", False))
             for shot in group:
                 # 每個畫面各自包起來。原本只有群組層級的 try，
                 # 一個網址導覽失敗就會中止同尺寸的其餘畫面，
                 # 大量畫面靜默沒拍到而報告只提一行錯誤。
                 try:
                     captures, errors = run_shot(
-                        browser, shot, current_dir, baseline_dir, taken, cfg)
+                        browser, shot, current_dir, baseline_dir, taken, cfg, project)
                 except Exception as exc:
                     out["errors"].append(
                         str(shot.get("name") or "shot") + "：這個畫面失敗了 " + str(exc))

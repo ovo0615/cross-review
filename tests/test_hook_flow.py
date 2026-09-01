@@ -685,6 +685,44 @@ def scenario_hardening(base: Path) -> None:
           "絕對不能外流" not in stext, stext[:300])
     check("同一份工作單裡的程式碼檔仍然會被收錄",
           any(f.endswith("ok.py") for f in smeta["files"]), str(smeta["files"]))
+    check("被拒絕的檔案有進 rejected 而不是靜默消失",
+          any(str(f).endswith(".env") for f in smeta["rejected"]),
+          str(smeta["rejected"]))
+
+    # 被拒絕的「刪除項」也要進 rejected。只記 files 的話，工作單若只含
+    # 這種刪除項就會變成「沒有改動」→ 回傳成功 → 寫 .done → 假完成。
+    djob = {"round": 1, "transcript": str(base / "nonexistent.jsonl"),
+            "start_line": 0, "end_line": 0, "files": [],
+            "deleted": [str(base / "outside_deleted.py"), str(secretproj / "gone.env")]}
+    _dt, dmeta = review.build_code_dossier(secretproj, djob, common.DEFAULT_CONFIG)
+    check("被拒絕的刪除項也會進 rejected",
+          len(dmeta["rejected"]) == 2, str(dmeta["rejected"]))
+    check("只含被拒絕刪除項時不會被當成「沒有改動」",
+          not dmeta["files"] and not dmeta["deleted"] and dmeta["rejected"],
+          str(dmeta))
+
+    # 個別 PNG 路徑也要檢查，不能只檢查 shots/ 目錄本身。
+    pngproj = base / "pngproj"
+    (pngproj / ".claude" / "review" / "shots").mkdir(parents=True)
+    pngout = base / "png_outside"
+    pngout.mkdir(exist_ok=True)
+    plink = pngproj / ".claude" / "review" / "shots" / "x.png"
+    made_p = False
+    try:
+        plink.symlink_to(pngout, target_is_directory=True)
+        made_p = True
+    except (OSError, NotImplementedError):
+        if os.name == "nt":
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(plink), str(pngout)],
+                               capture_output=True, timeout=30)
+            made_p = r.returncode == 0 and plink.exists()
+    check("shots/ 目錄本身是安全的",
+          common.review_child_is_safe(pngproj, "shots"))
+    if made_p:
+        check("指向專案外的個別 PNG 路徑會被判定不安全",
+              not common.review_child_is_safe(pngproj, "shots", "x.png"))
+    else:
+        print("[SKIP] 指向專案外的個別 PNG 路徑會被判定不安全（無法建立連結）")
 
     # --- 設定值壞掉要回退，不能讓背景審查例外結束 ---
     for bad in ({"max_files": "四十"}, {"max_files": -3}, {"max_files": None},

@@ -148,24 +148,39 @@ def _free_port() -> int:
 class Browser:
     """一個 headless Chrome 行程加一個分頁，用完就收乾淨。"""
 
-    def __init__(self, chrome: str, width: int, height: int, timeout: float = 30.0):
+    def __init__(self, chrome: str, width: int, height: int, timeout: float = 30.0,
+                 local_only: bool = True):
         self.port = _free_port()
         self.profile = Path(tempfile.mkdtemp(prefix="xrv-chrome-"))
         self.timeout = timeout
+
+        args = [
+            chrome,
+            "--headless=new",
+            "--disable-gpu",
+            "--hide-scrollbars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--remote-debugging-port=" + str(self.port),
+            "--user-data-dir=" + str(self.profile),
+            "--window-size=" + str(width) + "," + str(height),
+        ]
+        if local_only:
+            # 載入之後再檢查 location.href 是來不及的——請求早就發出去了。
+            # 頁面用 JavaScript 或 meta refresh 轉向外部時，事後拒絕擋不住
+            # 那一次外連。所以要在行程層級先斷掉對外的路：
+            #   1. 所有主機名稱解析失敗，localhost 例外（擋掉用網域的外連）
+            #   2. 非本機的流量一律走一個沒有人在聽的 proxy（連 IP 直連也擋掉）
+            args += [
+                "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost",
+                "--proxy-server=http://127.0.0.1:1",
+                "--proxy-bypass-list=localhost;127.0.0.1;[::1]",
+            ]
+        args.append("about:blank")
+
         self.proc = subprocess.Popen(
-            [
-                chrome,
-                "--headless=new",
-                "--disable-gpu",
-                "--hide-scrollbars",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-extensions",
-                "--remote-debugging-port=" + str(self.port),
-                "--user-data-dir=" + str(self.profile),
-                "--window-size=" + str(width) + "," + str(height),
-                "about:blank",
-            ],
+            args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
