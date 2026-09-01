@@ -218,7 +218,12 @@ def build_code_dossier(project: Path, job: dict, cfg: dict) -> tuple:
     # 工作單本身的路徑驗證過了，但它列的檔案路徑沒有。這支程式不該
     # 假設工作單的內容可信：裡面的路徑若指向專案外，內容就會被送進 Codex。
     all_pinned = list(job.get("files") or [])
-    pinned = [f for f in all_pinned if common.is_inside(str(f), project)]
+    # 除了「在專案內」，還必須是程式碼檔。只擋路徑不擋種類的話，
+    # 被竄改的工作單可以把 .env、金鑰或任何專案內的私密檔列進來，
+    # 內容就被讀進材料包送給審查者了。hook 只會寫程式碼檔進去，
+    # 但這支程式不該假設工作單可信。
+    pinned = [f for f in all_pinned
+              if common.is_inside(str(f), project) and common.is_code_file(str(f))]
     # 被越界過濾掉的路徑不能靜默消失。檔案在派工後被換成指向專案外的連結時，
     # 它會同時從 files 與 deleted 消失，run_code 看到空清單就回 0、寫 .done，
     # 於是一個沒有產生報告的回合被當成完成——安全修正造出了新的假完成路徑。
@@ -229,7 +234,8 @@ def build_code_dossier(project: Path, job: dict, cfg: dict) -> tuple:
     # deleted 也要過濾。上一輪只為 files 加了越界檢查就收工，
     # 而 deleted 一樣會被送進 git_diff——同一件事又只做了一半。
     deleted = [f for f in (job.get("deleted") or [])
-               if common.is_inside(str(f), project)] + vanished
+               if common.is_inside(str(f), project)
+               and common.is_code_file(str(f))] + vanished
     source = job.get("source") or "工作單（hook 在回合結束當下釘住的清單）"
 
     max_files = common.positive_int(cfg, "max_files")

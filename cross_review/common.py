@@ -114,6 +114,25 @@ def review_dir_is_safe(project: Path) -> bool:
     return True
 
 
+def review_child_is_safe(project: Path, *parts) -> bool:
+    """確認 .claude/review 底下的某個子項沒有被改指向別處。
+
+    只檢查 review 目錄本身是不夠的：shots/、baseline/、errors.log 都可以
+    各自被做成連結。最陰的是**懸空的** errors.log —— exists() 是 False，
+    所以任何「存在才檢查」的寫法都會跳過它，接著 open(path, "a")
+    會跟著連結把內容追加到專案外的檔案上。
+
+    判斷方式跟 review_dir_is_safe 一樣：解析後必須正好等於預期位置。
+    """
+    if not review_dir_is_safe(project):
+        return False
+    target = review_dir(project).joinpath(*parts)
+    try:
+        return target.resolve() == review_dir(project).resolve().joinpath(*parts)
+    except OSError:
+        return False
+
+
 def is_disabled(project: Path) -> bool:
     """專案層級的永久關閉開關（第 6 題）。"""
     return (review_dir(project) / "DISABLED").exists()
@@ -439,15 +458,12 @@ def log_error(project: Path, message: str) -> None:
     寫之前先確認路徑沒有越界。errors.log 是用 append 開的，
     目標若是指向專案外的 symlink，就會直接追加到使用者的別的檔案上。
     """
-    if not review_dir_is_safe(project):
+    # 不能用「存在才檢查」：懸空的 errors.log 連結 exists() 是 False，
+    # 會直接跳過檢查，然後 open(..., "a") 跟著連結寫到專案外。
+    if not review_child_is_safe(project, "errors.log"):
         return
     line = "[" + time.strftime("%Y-%m-%d %H:%M:%S") + "] " + message + "\n"
     path = review_dir(project) / "errors.log"
-    try:
-        if path.exists() and path.resolve().parent != path.parent.resolve():
-            return                       # errors.log 自己是連結，指向別處
-    except OSError:
-        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8", newline="\n") as fh:
         fh.write(line)

@@ -617,6 +617,75 @@ def scenario_hardening(base: Path) -> None:
     check("不安全的專案不會寫 errors.log",
           not (asfile / ".claude" / "review").is_dir())
 
+    # --- review 目錄底下的「子項」各自也要檢查 ---
+    # 最陰的是懸空的 errors.log 連結：exists() 是 False，
+    # 所以「存在才檢查」的寫法會跳過它，接著 open(..., "a") 跟著寫到外面。
+    childproj = base / "childlink"
+    (childproj / ".claude" / "review").mkdir(parents=True)
+    ghost2 = base / "ghost_errors_target"
+    elink = childproj / ".claude" / "review" / "errors.log"
+    made_e = False
+    try:
+        elink.symlink_to(ghost2)
+        made_e = True
+    except (OSError, NotImplementedError):
+        # 檔案 symlink 要權限，但目錄 junction 不用。
+        # 先指到一個存在的目錄再把它刪掉，就得到一個懸空連結——
+        # review_child_is_safe 不分檔案或目錄，走的是同一條判斷。
+        if os.name == "nt":
+            ghost2.mkdir(exist_ok=True)
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(elink), str(ghost2)],
+                               capture_output=True, timeout=30)
+            made_e = r.returncode == 0
+            if made_e:
+                try:
+                    ghost2.rmdir()
+                except OSError:
+                    made_e = False
+    check("review 目錄本身是安全的", common.review_dir_is_safe(childproj))
+    if made_e:
+        check("懸空的 errors.log 連結會被判定不安全",
+              not common.review_child_is_safe(childproj, "errors.log"))
+        common.log_error(childproj, "這一行不該跟著連結寫到外面")
+        check("懸空的 errors.log 連結不會被寫入", not ghost2.exists(),
+              "ghost 檔被建立了")
+    else:
+        print("[SKIP] 懸空的 errors.log 連結會被判定不安全（無法建立檔案連結）")
+
+    # shots/ 指向專案外也要擋
+    slink = childproj / ".claude" / "review" / "shots"
+    made_s = False
+    outdir = base / "shots_outside"
+    outdir.mkdir(exist_ok=True)
+    try:
+        slink.symlink_to(outdir, target_is_directory=True)
+        made_s = True
+    except (OSError, NotImplementedError):
+        if os.name == "nt":
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(slink), str(outdir)],
+                               capture_output=True, timeout=30)
+            made_s = r.returncode == 0 and slink.exists()
+    if made_s:
+        check("指向專案外的 shots/ 會被判定不安全",
+              not common.review_child_is_safe(childproj, "shots"))
+    else:
+        print("[SKIP] 指向專案外的 shots/ 會被判定不安全（無法建立連結）")
+
+    # --- 工作單裡的非程式碼檔不能被讀進材料包 ---
+    secretproj = base / "secretproj"
+    (secretproj / ".claude").mkdir(parents=True)
+    secret = secretproj / ".env"
+    secret.write_text("API_KEY=絕對不能外流\n", encoding="utf-8")
+    (secretproj / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    sjob = {"round": 1, "transcript": str(base / "nonexistent.jsonl"),
+            "start_line": 0, "end_line": 0,
+            "files": [str(secret), str(secretproj / "ok.py")], "deleted": []}
+    stext, smeta = review.build_code_dossier(secretproj, sjob, common.DEFAULT_CONFIG)
+    check("工作單裡的 .env 不會被讀進材料包",
+          "絕對不能外流" not in stext, stext[:300])
+    check("同一份工作單裡的程式碼檔仍然會被收錄",
+          any(f.endswith("ok.py") for f in smeta["files"]), str(smeta["files"]))
+
     # --- 設定值壞掉要回退，不能讓背景審查例外結束 ---
     for bad in ({"max_files": "四十"}, {"max_files": -3}, {"max_files": None},
                 {"max_files": 0}):

@@ -311,6 +311,15 @@ def collect(project: Path, cfg: dict) -> dict:
         out["errors"].append("找不到 chrome.exe，無法截圖")
         return out
 
+    # shots/ 與 baseline/ 各自也可能被做成指向專案外的連結。
+    # 只檢查上層的 .claude/review 擋不住這個——截圖會被寫到外面去。
+    for name in ("shots", "baseline"):
+        if not common.review_child_is_safe(project, name):
+            out["errors"].append(
+                str(common.review_dir(project) / name)
+                + " 指向專案外部，拒絕在那裡寫入截圖，本回合沒有視覺審查。")
+            return out
+
     current_dir = common.review_dir(project) / "shots"
     baseline_dir = common.review_dir(project) / "baseline"
     current_dir.mkdir(parents=True, exist_ok=True)
