@@ -308,8 +308,16 @@ def positive_int(cfg: dict, key: str, minimum: int = 1) -> int:
     try:
         value = int(cfg.get(key, default))
     except (TypeError, ValueError):
-        return default
-    return value if value >= minimum else default
+        return default          # 根本不是數字：用有文件記載的預設值
+    if value <= 0:
+        return default          # 負數或零顯然是打錯了
+    if value < minimum:
+        # 低於下限就夾到下限，**不能退回預設**。
+        # 預設遠大於下限（例如 max_bytes 預設 200,000、下限 1,000），
+        # 退回預設等於「你要求更小，我給你大 200 倍的東西」——
+        # 靜默給出比要求更大的值，永遠比給出更小的危險。
+        return minimum
+    return value
 
 
 def ensure_config(project: Path) -> dict:

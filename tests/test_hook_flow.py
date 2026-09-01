@@ -625,6 +625,16 @@ def scenario_hardening(base: Path) -> None:
               got == common.DEFAULT_CONFIG["max_files"], str(got))
     check("正常的 max_files 照用", common.positive_int({"max_files": 7}, "max_files") == 7)
 
+    # 低於下限要夾到下限，不能退回預設——預設遠大於下限，
+    # 退回去等於「你要求更小，我給你大得多的東西」。
+    got = common.positive_int({"max_bytes": 500}, "max_bytes", 1000)
+    check("max_bytes 低於下限時夾到下限而不是退回預設",
+          got == 1000, str(got) + "（預設是 "
+          + str(common.DEFAULT_CONFIG["max_bytes"]) + "）")
+    check("任何情況下都不會給出比要求更大的值",
+          common.positive_int({"max_bytes": 500}, "max_bytes", 1000)
+          < common.DEFAULT_CONFIG["max_bytes"])
+
     # --- 原子寫入：暫存檔不能留下，內容必須完整 ---
     target = proj / "atomic.json"
     common.write_json(target, {"a": 1})
