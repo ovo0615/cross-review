@@ -1,0 +1,12 @@
+# 審查產物與狀態：每台機器、每個 clone 各自累積
+.claude/review/
+
+# hook 的安裝設定含絕對路徑，每台機器不一樣
+.claude/settings.json
+.claude/settings.local.json
+
+# hook 自己出錯時的紀錄
+hook-crash.log
+
+__pycache__/
+*.py[cod]

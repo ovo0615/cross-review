@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["blocking", "verdict", "findings"],
+  "properties": {
+    "blocking": {
+      "type": "boolean",
+      "description": "只有在『再走下去會白做』時才設 true：做出來的不是使用者要的（漏做、多做、方向偏了），或程式碼會壞（崩潰、資料損毀、安全漏洞、資源洩漏）。風格、命名、架構偏好、測試覆蓋不足一律 false。"
+    },
+    "verdict": {
+      "type": "string",
+      "description": "一句話總結。若材料包標示了截斷，這句話必須提到你只看了其中一部分。"
+    },
+    "findings": {
+      "type": "array",
+      "description": "具體發現。沒有問題時給空陣列，不要為了交差而湊。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "category", "file", "summary"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["blocking", "major", "minor", "nit"]
+          },
+          "category": {
+            "type": "string",
+            "enum": ["需求偏離", "正確性", "安全", "效能", "架構", "風格", "測試"]
+          },
+          "file": {
+            "type": "string",
+            "description": "相對於專案根目錄的路徑。跨檔案的問題填最相關的那一個。"
+          },
+          "summary": {
+            "type": "string",
+            "description": "問題是什麼，以及在什麼情況下會出事。不要只說『建議改善』。"
+          }
+        }
+      }
+    }
+  }
+}

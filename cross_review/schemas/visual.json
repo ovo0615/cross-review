@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "description": "一句話總結這些畫面的狀態。"
+    },
+    "findings": {
+      "type": "array",
+      "description": "具體的視覺缺陷。畫面沒問題時給空陣列。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "category", "shot", "where", "summary"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["blocking", "major", "minor", "nit"]
+          },
+          "category": {
+            "type": "string",
+            "enum": ["文字截斷", "溢出", "元素重疊", "對比度", "中文顯示", "字型", "標點", "對齊間距", "視覺回歸", "其他"]
+          },
+          "shot": {
+            "type": "string",
+            "description": "哪一個畫面（用材料包裡給的畫面名稱）。"
+          },
+          "where": {
+            "type": "string",
+            "description": "畫面上的哪個位置或哪段文字。要具體到人可以一眼找到。"
+          },
+          "summary": {
+            "type": "string",
+            "description": "看到什麼、為什麼是問題。視覺回歸類請寫明跟基準圖比起來哪裡不一樣。"
+          }
+        }
+      }
+    }
+  }
+}
