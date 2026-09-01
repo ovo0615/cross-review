@@ -346,6 +346,42 @@ def scenario_boundaries(base: Path) -> None:
     check("開了 allow_remote_urls 之後才放行",
           not url_is_allowed("http://10.0.0.5:8080/", dict(plain, allow_remote_urls=True)))
 
+    # 網址白名單與 Chrome 的 proxy bypass 必須是同一份來源導出的。
+    # 兩套手寫清單一定會不同步：0.0.0.0 通過了白名單卻不在 bypass 裡，
+    # 實際導覽被送去失效的 proxy，截圖直接失敗。
+    from cross_review.cdp import LOCAL_HOSTS, _bypass_list
+    bypass = _bypass_list()
+    mismatched = [h for h in LOCAL_HOSTS
+                  if ("[::1]" if h == "::1" else h) not in bypass]
+    check("每個本機主機都在 proxy bypass 清單裡", not mismatched, str(mismatched))
+
+    # Browser 建構失敗時不能留下暫存 profile 與孤兒行程。
+    import tempfile as _tf
+    from cross_review.cdp import Browser as _Browser
+    before = set(Path(_tf.gettempdir()).glob("xrv-chrome-*"))
+    try:
+        _Browser(str(base / "不存在的chrome.exe"), 800, 600)
+        check("不存在的 Chrome 應該要拋例外", False, "沒有拋例外")
+    except Exception:
+        check("不存在的 Chrome 會拋例外", True)
+    after = set(Path(_tf.gettempdir()).glob("xrv-chrome-*"))
+    check("建構失敗不會留下暫存 profile", after <= before,
+          str(sorted(p.name for p in (after - before))))
+
+    # scroll 的參數不對時要說出來，不能靜默成功。
+    from cross_review.shots import apply_action as _apply
+
+    class _FakeBrowser:
+        def eval(self, expr):
+            return False
+
+    check("scroll 給錯 to 且沒有 selector 會回報錯誤",
+          bool(_apply(_FakeBrowser(), {"do": "scroll", "to": "middle"})),
+          repr(_apply(_FakeBrowser(), {"do": "scroll", "to": "middle"})))
+    check("scroll 的 selector 找不到元素會回報錯誤",
+          bool(_apply(_FakeBrowser(), {"do": "scroll", "selector": "#nope"})),
+          repr(_apply(_FakeBrowser(), {"do": "scroll", "selector": "#nope"})))
+
 
 def scenario_worktree(base: Path) -> None:
     """linked worktree：.git 是檔案不是目錄。

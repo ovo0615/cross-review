@@ -139,6 +139,20 @@ class WebSocket:
             pass
 
 
+# 「本機」的唯一定義。網址白名單與 Chrome 的 proxy bypass 都從這裡導出——
+# 兩套手寫清單一定會不同步：先前 0.0.0.0 通過了白名單，實際導覽卻被送去
+# 失效的 proxy，截圖直接失敗。
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
+
+
+def _bypass_list() -> str:
+    """給 --proxy-bypass-list 用。IPv6 要用中括號的寫法。"""
+    entries = []
+    for host in sorted(LOCAL_HOSTS):
+        entries.append("[::1]" if host == "::1" else host)
+    return ";".join(dict.fromkeys(entries))
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -175,18 +189,26 @@ class Browser:
             args += [
                 "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost",
                 "--proxy-server=http://127.0.0.1:1",
-                "--proxy-bypass-list=localhost;127.0.0.1;[::1]",
+                "--proxy-bypass-list=" + _bypass_list(),
             ]
         args.append("about:blank")
 
-        self.proc = subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        self.proc = None
         self.ws = None
         self._id = 0
-        self._connect()
+        try:
+            self.proc = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._connect()
+        except BaseException:
+            # 建構子拋例外時 close() 永遠不會被呼叫，呼叫端的 finally 也
+            # 因為變數還沒被賦值而清不掉——Chrome 行程與暫存 profile 就留下來了。
+            # 重試幾次就會累積成一堆孤兒程序。這裡自己收乾淨再把例外丟出去。
+            self.close()
+            raise
 
     def _endpoint(self, path: str, timeout: float):
         deadline = time.time() + timeout
@@ -260,16 +282,23 @@ class Browser:
         return text
 
     def close(self) -> None:
+        """收乾淨。要能在半初始化的狀態下被呼叫（建構子失敗時就是這樣）。"""
         if self.ws:
-            self.ws.close()
-        try:
-            self.proc.terminate()
-            self.proc.wait(timeout=10)
-        except Exception:
             try:
-                self.proc.kill()
+                self.ws.close()
             except Exception:
                 pass
+            self.ws = None
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=10)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
         shutil.rmtree(self.profile, ignore_errors=True)
 
     def __enter__(self):

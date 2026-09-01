@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import common
-from .cdp import Browser
+from .cdp import LOCAL_HOSTS, Browser
 
 CHROME_CANDIDATES = [
     r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
@@ -36,9 +36,6 @@ def resolve_chrome():
         if Path(path).exists():
             return path
     return None
-
-
-LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
 
 
 def url_is_allowed(url: str, cfg: dict) -> str:
@@ -212,16 +209,25 @@ def apply_action(browser: Browser, action: dict) -> str:
             if found is False:
                 return "找不到元素 " + str(selector) + "，或填入後的值跟預期不符"
         elif kind == "scroll":
-            where = str(action.get("to", "bottom")).lower()
+            # 參數不對時要說出來。原本 to 不是 top/bottom 又沒給 selector 時
+            # 什麼都不做卻回報成功，後面照樣截圖——審查到的是錯的畫面，
+            # 而且沒有任何錯誤訊息。
+            where = str(action.get("to", "")).lower()
             if where == "bottom":
                 browser.eval("window.scrollTo(0, document.body.scrollHeight)")
             elif where == "top":
                 browser.eval("window.scrollTo(0, 0)")
             elif selector:
-                browser.eval(
+                found = browser.eval(
                     "(() => { const el = document.querySelector(" + repr(selector) + ");"
-                    " if (el) el.scrollIntoView({block:'center'}); })()"
+                    " if (!el) return false; el.scrollIntoView({block:'center'});"
+                    " return true; })()"
                 )
+                if not found:
+                    return "scroll 找不到元素 " + str(selector)
+            else:
+                return ("scroll 需要 to（top 或 bottom）或 selector，"
+                        "收到的 to 是「" + str(action.get("to", "")) + "」")
         elif kind == "wait":
             import time as _t
             _t.sleep(min(float(action.get("ms", 500)) / 1000.0, 10.0))
