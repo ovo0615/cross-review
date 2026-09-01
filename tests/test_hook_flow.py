@@ -392,6 +392,23 @@ def scenario_boundaries(base: Path) -> None:
     check("有 proxy 環境時，我們的 opener 仍然不帶 proxy 處理",
           "ProxyHandler" not in ours_names, str(ours_names))
 
+    # 問 Chrome 除錯埠的那條路也不能走 proxy——它回傳的 WebSocket 位址
+    # 接下來會被拿去連線，等於讓外部決定我們的 CDP 連到哪裡。
+    from cross_review.cdp import _NO_PROXY, _is_local_ws
+    check("除錯埠的請求不帶 proxy 處理",
+          "ProxyHandler" not in [type(h).__name__ for h in _NO_PROXY.handlers],
+          str([type(h).__name__ for h in _NO_PROXY.handlers]))
+
+    for good in ("ws://127.0.0.1:9222/devtools/page/AB",
+                 "ws://localhost:9222/devtools/page/AB"):
+        check("接受本機的 CDP 位址 " + good.split("/")[2], _is_local_ws(good))
+    for bad in ("ws://evil.example.com:9222/devtools/page/AB",
+                "ws://10.0.0.5:9222/devtools/page/AB",
+                "http://127.0.0.1:9222/devtools/page/AB",
+                "", "不是網址"):
+        check("拒絕非本機或非 ws 的 CDP 位址 " + repr(bad)[:34],
+              not _is_local_ws(bad))
+
     # 撞名一千次之後也不能回傳已用過的名字（那會覆寫別人的基準圖）。
     from cross_review.shots import unique_base
     taken = set()

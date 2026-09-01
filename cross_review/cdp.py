@@ -154,6 +154,27 @@ def _bypass_list() -> str:
     return ";".join(dict.fromkeys(entries))
 
 
+# 對本機除錯埠的請求絕不能走系統 proxy。
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _is_local_ws(url: str) -> bool:
+    """CDP 的 WebSocket 端點必須落在本機。
+
+    webSocketDebuggerUrl 是「別人給的」——正常情況下是本機 Chrome，
+    但只要那一段 HTTP 被 proxy 或異常回應影響，它就可能指向外部。
+    連上去之後我們會把整個瀏覽器交給對方指揮，所以連線前必須確認落點。
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("ws", "wss"):
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in LOCAL_HOSTS
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -212,12 +233,20 @@ class Browser:
             raise
 
     def _endpoint(self, path: str, timeout: float):
+        """問 Chrome 的除錯埠。
+
+        一定要用不走 proxy 的 opener。全域的 urlopen 會沿用系統的
+        HTTP_PROXY／HTTPS_PROXY，沒排除 127.0.0.1 的話，這個對本機除錯埠的
+        請求會被送去外部 proxy——而它回傳的 webSocketDebuggerUrl
+        接下來會被拿去連線，等於讓外部決定我們的 CDP 連到哪裡。
+        （page_is_ready 那邊剛修好同一個問題，這裡漏了。）
+        """
         deadline = time.time() + timeout
         last = None
         while time.time() < deadline:
             try:
                 url = "http://127.0.0.1:" + str(self.port) + path
-                with urllib.request.urlopen(url, timeout=2) as resp:
+                with _NO_PROXY.open(url, timeout=2) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except Exception as exc:
                 last = exc
@@ -229,7 +258,11 @@ class Browser:
         page = next((t for t in targets if t.get("type") == "page"), None)
         if not page:
             raise ConnectionError("Chrome 沒有可用的分頁")
-        self.ws = WebSocket(page["webSocketDebuggerUrl"], timeout=self.timeout)
+        ws_url = str(page.get("webSocketDebuggerUrl") or "")
+        if not _is_local_ws(ws_url):
+            raise ConnectionError(
+                "Chrome 回報的除錯 WebSocket 不在本機，拒絕連線：" + ws_url)
+        self.ws = WebSocket(ws_url, timeout=self.timeout)
 
     def call(self, method: str, params: dict = None, timeout: float = None):
         """送一個 CDP 指令，等它自己的回應（沿路的事件先擱著）。"""
