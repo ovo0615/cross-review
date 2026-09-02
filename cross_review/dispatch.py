@@ -140,8 +140,15 @@ def backlog_note(files: list, deletions: list) -> str:
     寧可吵也不能沉默：「累積著沒審」跟「審過了沒問題」在畫面上長得一模一樣。
     """
     n = len(files) + len(deletions)
-    return ("cross-review：累積 " + str(n) + " 個程式碼檔案還沒審查"
-            "（要送審就說「審查」，或用 /cross-review）")
+    # 措辭是指令，不是邀請。
+    #
+    # 原本寫「（要送審就說「審查」，或用 /cross-review）」，對執行者來說那是
+    # 一句可以照做的建議：實測同一時間兩個對話，一個等使用者開口、另一個看到
+    # 這行就自己跑了 --now。兩邊設定完全相同，差別只在措辭有解讀空間。
+    # manual 的定義是「使用者說了才送」，訊息必須把那件事講成規則。
+    return ("cross-review：累積 " + str(n) + " 個程式碼檔案還沒審查。"
+            "這個專案是 manual 模式——**執行者不要自己送審**，"
+            "等使用者說「審查」再送。")
 
 
 def over_threshold(cfg: dict, project: Path, files: list, deletions: list,
