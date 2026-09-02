@@ -1245,7 +1245,9 @@ def scenario_trigger_modes(base: Path) -> None:
     cfg_path = proj / ".claude" / "review" / "config.json"
     check("全新專案會產生 config.json", cfg_path.exists())
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    check("預設觸發模式是 threshold", cfg.get("trigger") == "threshold", cfg.get("trigger"))
+    # 預設是 manual：工具改成全域安裝之後，「要不要讓這個專案的程式碼出去給
+    # 第三方模型」不再有安裝那一刻的表態動作，所以預設不送，使用者說了才送。
+    check("預設觸發模式是 manual", cfg.get("trigger") == "manual", cfg.get("trigger"))
     check("小改不攔阻", "decision" not in (out or {}), out)
     check("小改會報累積量", "累積 1 個" in (out or {}).get("systemMessage", ""), out)
 
