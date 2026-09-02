@@ -231,6 +231,9 @@ def main() -> int:
             watermark = Path(transcript_path).stat().st_ctime
         except OSError:
             watermark = time.time() - 900
+    # 這個時刻必須在偵測**之前**取：掃描期間被改的檔案不會進 files，
+    # 用掃描之後的時刻當水位線會把它們算成已審，之後再也偵測不到。
+    scan_started = time.time()
     parsed, end_line, files, deleted = dispatch.detect(
         project, transcript_path, state.get("cursor", 0), watermark)
 
@@ -268,12 +271,12 @@ def main() -> int:
 
     # ---- 建工作單並攔阻 ----
     round_no = dispatch.next_round(project, state)
-    now = time.time()
+    now = scan_started
     head_now = tx.git_head(project)
     job_path = dispatch.create_job(
         project, round_no, transcript_path, state.get("cursor", 0), end_line,
         watermark, files, fresh_deletions,
-        base_sha=state.get("head_sha") or head_now)
+        base_sha=state.get("head_sha") or head_now, dispatched=scan_started)
 
     # 這一次的 HEAD 就是下一輪的起點。
     state["head_sha"] = head_now

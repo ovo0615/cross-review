@@ -74,8 +74,14 @@ def write_receipt(project: Path, job: dict, head_sha: str) -> None:
 
 def create_job(project: Path, round_no: int, transcript_path: str, cursor: int,
                end_line: int, watermark: float, files: list, deletions: list,
-               base_sha: str):
-    """寫出 job-N.json。不碰 state.json——那是 hook 的責任。"""
+               base_sha: str, dispatched: float = None):
+    """寫出 job-N.json。不碰 state.json——那是 hook 的責任。
+
+    `dispatched` 必須是**偵測開始之前**取的時刻，由呼叫端傳進來。
+    在這裡才 time.time() 的話，偵測掃描那段期間（實測 44～165 ms）被改的
+    檔案會落進空窗：掃描已經走過它，所以不在 files 裡；mtime 卻早於新的
+    水位線，收據兌現後就永遠不會再被偵測到——而且不會有任何訊息。
+    """
     job_path = common.review_dir(project) / ("job-" + str(round_no) + ".json")
     fingerprints = {}
     for path in files:
@@ -91,8 +97,8 @@ def create_job(project: Path, round_no: int, transcript_path: str, cursor: int,
         "start_line": cursor,
         "end_line": end_line,
         "since": watermark,
-        # 派工當下的時刻。手動觸發時由收據沿用它當新的水位線。
-        "dispatched": time.time(),
+        # 偵測開始當下的時刻。手動觸發時由收據沿用它當新的水位線。
+        "dispatched": float(dispatched) if dispatched else time.time(),
         # 這一輪的起點是「**上一次審查當下**的 HEAD」，不是現在的 HEAD。
         # hook 在回合結束時才跑，那時執行者可能已經把這一輪 commit 掉了，
         # 拿當下的 HEAD 當基準，diff 只會剩下 commit 之後的零星改動。

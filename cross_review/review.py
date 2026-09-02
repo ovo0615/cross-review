@@ -107,6 +107,23 @@ def add_user_voice(add, parsed: dict, job: dict = None) -> None:
             add(">")
         add()
 
+    referenced = parsed.get("referenced_context") or []
+    if referenced:
+        add("## 使用者所同意的「建議」本文")
+        add()
+        add("使用者說「依照你的建議」「可以動手」這類話時，指的是**執行者上一則"
+            "回覆**裡的內容。那段文字是執行者寫的，但使用者已經同意，"
+            "所以它就是這一輪的需求，可以拿來核對做到了沒有。")
+        add()
+        add("沒有這一段的話，你會看到使用者同意了某件事卻不知道那是什麼，"
+            "於是只能回報「無法完整核對需求」——第 31 回合實際發生過。")
+        add()
+        for text in referenced[-2:]:      # 只取最近兩則，再多就是材料包在膨脹
+            for line in text.splitlines():
+                add("> " + line)
+            add(">")
+        add()
+
     decisions = parsed.get("user_decisions") or []
     if decisions:
         add("## 使用者在這段區間做過的決定（逐字）")
@@ -900,6 +917,7 @@ def run_now(project: Path) -> int:
         except OSError:
             watermark = 0.0
 
+    scan_started = time.time()      # 必須在偵測之前取，理由見 create_job
     _parsed, end_line, files, deleted = dispatch.detect(
         project, transcript_path, int(state.get("cursor", 0)), watermark)
     reported = {p for p in (state.get("reported_deletions") or [])
@@ -914,7 +932,7 @@ def run_now(project: Path) -> int:
     job_path = dispatch.create_job(
         project, round_no, transcript_path, int(state.get("cursor", 0)),
         end_line, watermark, files, deletions,
-        base_sha=state.get("head_sha") or head_now)
+        base_sha=state.get("head_sha") or head_now, dispatched=scan_started)
     job = common.read_json(job_path) or {}
 
     modes = []

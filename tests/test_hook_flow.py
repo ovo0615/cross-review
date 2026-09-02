@@ -117,7 +117,10 @@ def check(label: str, condition: bool, detail: str = "") -> None:
     RESULTS.append(bool(condition))
     line = ("[PASS] " if condition else "[FAIL] ") + label
     if detail and not condition:
-        line += "\n        " + detail
+        # str() 不能省：detail 常常是 list 或 dict，而這裡只有斷言失敗時才會走到。
+        # 少了它，失敗的測試會以 TypeError 崩潰而不是印出 [FAIL]——
+        # 整批測試就這樣停在半路，看起來像環境壞了而不是有測試沒過。
+        line += "\n        " + str(detail)
     print(line)
 
 
@@ -1351,6 +1354,59 @@ def scenario_receipt(base: Path) -> None:
     hit = dispatch.over_threshold(dict(_c.DEFAULT_CONFIG), p4, [str(newbig)], [], "HEAD")
     check("未追蹤的大檔會觸發門檻", bool(hit), repr(hit))
 
+    # --- 派工時刻必須在偵測之前取（第 31 回合審查） ---
+    p5 = base / "dispatchclock"
+    (p5 / ".claude" / "review").mkdir(parents=True)
+    jp5 = dispatch.create_job(p5, 1, "", 0, 0, 0.0, [], [], base_sha="a",
+                              dispatched=12345.0)
+    check("create_job 會沿用呼叫端傳進來的派工時刻",
+          json.loads(jp5.read_text(encoding="utf-8"))["dispatched"] == 12345.0)
+
+
+def scenario_referenced_context(base: Path) -> None:
+    """使用者說「依照你的建議」時，那個建議本文要進材料包。
+
+    材料包只收使用者發言的話，審查者會知道使用者同意了某件事卻不知道
+    那是什麼——第 31 回合的審查就回報過「無法完整核對需求」。
+    """
+    from cross_review import transcript as tx
+    t = base / "refctx.jsonl"
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": "幫我修那個 bug"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "我建議三件事：拆檔案、提早取時刻、補材料包"}]}},
+        {"type": "user", "message": {"role": "user", "content": "可以動手"}},
+    ]
+    t.write_text("\n".join(
+        json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+    parsed = tx.parse(t, 0)
+    check("指代時會收進上一則助手回覆",
+          any("拆檔案" in x for x in parsed["referenced_context"]),
+          parsed["referenced_context"])
+
+    rows2 = rows[:2] + [{"type": "user",
+                         "message": {"role": "user", "content": "改成藍色"}}]
+    t2 = base / "refctx2.jsonl"
+    t2.write_text("\n".join(
+        json.dumps(r, ensure_ascii=False) for r in rows2), encoding="utf-8")
+    check("沒有指代就不收，材料包不會白白變大",
+          tx.parse(t2, 0)["referenced_context"] == [],
+          tx.parse(t2, 0)["referenced_context"])
+
+    # 太長的回覆要截尾巴留結論，而且要講明被截過。
+    rows3 = [
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "x" * 9000 + "結論在這裡"}]}},
+        {"type": "user", "message": {"role": "user", "content": "依照你的建議"}},
+    ]
+    t3 = base / "refctx3.jsonl"
+    t3.write_text("\n".join(
+        json.dumps(r, ensure_ascii=False) for r in rows3), encoding="utf-8")
+    got = tx.parse(t3, 0)["referenced_context"]
+    check("過長的回覆保留結尾的結論",
+          got and "結論在這裡" in got[0], (got or [""])[0][-30:])
+    check("截斷有講明", got and "前面截斷" in got[0], (got or [""])[0][:30])
+
 
 def scenario_breaker_and_usage(base: Path) -> None:
     """斷路器與用量帳本。錯誤訊息是 2026-09-02 額度真的用完時擷取的原文。"""
@@ -1438,6 +1494,27 @@ def scenario_breaker_and_usage(base: Path) -> None:
           and breaker.paused_note(proj6, "visual") == "",
           "code=%r visual=%r" % (breaker.paused_note(proj6, "code"),
                                  breaker.paused_note(proj6, "visual")))
+
+    # 併行的兩個審查行程各自「讀出整份→改→整份寫回」時，後寫入者會蓋掉
+    # 前一個——而額度用完時兩邊幾乎同時失敗，那正是這個競態的典型情況。
+    # 修法是每個檔案只有一個寫入者：模式檔各自寫，全域檔只放額度／限流。
+    proj7 = base / "breakerproj7"
+    (proj7 / ".claude" / "review").mkdir(parents=True)
+    breaker.record_failure(proj7, REAL, "code")
+    check("額度暫停擋住另一個模式",
+          breaker.paused_note(proj7, "visual") != "", breaker.paused_note(proj7, "visual"))
+    breaker.record_success(proj7, "visual")
+    check("另一個模式成功不會蓋掉額度暫停",
+          breaker.paused_note(proj7, "code") != "", breaker.paused_note(proj7, "code"))
+    rdir7 = proj7 / ".claude" / "review"
+    # visual 沒有失敗過，所以不會有它的檔案——record_success() 對一份
+    # 本來就乾淨的狀態不寫入。要驗的是「code 的計數寫在自己的檔案裡」。
+    check("失敗計數寫在各模式自己的檔案裡",
+          (rdir7 / "breaker.code.json").exists(),
+          sorted(f.name for f in rdir7.glob("breaker*.json")))
+    check("全域檔只放額度暫停",
+          "failures" not in json.loads((rdir7 / "breaker.json").read_text(encoding="utf-8")),
+          json.loads((rdir7 / "breaker.json").read_text(encoding="utf-8")))
 
     # 短暫限流沒有恢復時間就不該當成額度耗盡而停一小時。
     proj4 = base / "breakerproj4"
@@ -1550,6 +1627,7 @@ def main() -> int:
         scenario_cdp_events(base)
         scenario_trigger_modes(base)
         scenario_receipt(base)
+        scenario_referenced_context(base)
         scenario_breaker_and_usage(base)
     finally:
         shutil.rmtree(base, ignore_errors=True)

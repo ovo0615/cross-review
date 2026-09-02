@@ -60,6 +60,17 @@ def _clean_user_text(text: str) -> str:
     return _COMMAND_TAGS.sub("", text).strip()
 
 
+# 使用者用來指涉「執行者上一則回覆」的說法。命中才會把那則回覆收進材料包，
+# 所以寧可窄一點：誤收的代價是材料包變大，漏收的代價是審查者看不懂需求。
+_REFERENTIAL = re.compile(
+    "你的建議|你說的|你提的|你列的|依照你|照你|按你|如你所說"
+    "|可以動手|可以執行|就這樣做|照做|都採用|採用你|同意你"
+    "|第[ ]*[0-9]+[ ]*項|那幾項|上面那"
+    "|your (recommendation|suggestion)|as you (suggested|said)"
+    "|go ahead|do it", re.I)
+_REFERENCE_MAX_BYTES = 6000
+
+
 def parse(transcript_path: Path, start_line: int = 0, stop_line: int = 0) -> dict:
     """讀第 start_line 行之後、到 stop_line（含）為止。stop_line 為 0 代表讀到檔尾。
 
@@ -72,6 +83,10 @@ def parse(transcript_path: Path, start_line: int = 0, stop_line: int = 0) -> dic
     """
     result = {
         "user_requests": [],   # 這段區間裡使用者說過的話（逐字）
+        # 使用者說「依照你的建議」時，那個建議本文在**執行者**的上一則回覆裡，
+        # 而材料包只收使用者發言。審查者於是知道使用者同意了某件事，
+        # 卻不知道那是什麼——第 31 回合的審查就是這樣回報「無法完整核對需求」。
+        "referenced_context": [],
         "user_decisions": [],  # 使用者在 AskUserQuestion 裡選的答案（逐字）
         "write_paths": [],     # Edit/Write 明確寫過的檔案
         "bash_commands": [],   # Bash 執行過的指令原文
@@ -84,6 +99,7 @@ def parse(transcript_path: Path, start_line: int = 0, stop_line: int = 0) -> dic
 
     # tool_use 的 id -> 工具名稱，用來認出哪個 tool_result 屬於 AskUserQuestion。
     tool_names = {}
+    last_assistant = ""
 
     with open(transcript_path, encoding="utf-8", errors="replace") as fh:
         for n, raw in enumerate(fh, 1):
@@ -130,10 +146,25 @@ def parse(transcript_path: Path, start_line: int = 0, stop_line: int = 0) -> dic
                 text = _clean_user_text(raw_text)
                 if text:
                     result["user_requests"].append(text)
+                    if last_assistant and _REFERENTIAL.search(text):
+                        result["referenced_context"].append(last_assistant)
                 continue
 
             if kind != "assistant":
                 continue
+
+            # 記住這一則助手回覆的文字。只有在下一則使用者發言出現指代
+            # （「依照你的建議」之類）時才會被收進材料包，平常不佔任何空間。
+            said = "\n".join(
+                b.get("text", "") for b in (message.get("content") or [])
+                if isinstance(b, dict) and b.get("type") == "text").strip()
+            if said:
+                encoded = said.encode("utf-8")
+                if len(encoded) > _REFERENCE_MAX_BYTES:
+                    # 取尾巴：建議與結論通常寫在最後。
+                    said = ("**[前面截斷]**\n"
+                            + encoded[-_REFERENCE_MAX_BYTES:].decode("utf-8", "ignore"))
+                last_assistant = said
 
             for block in message.get("content") or []:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":

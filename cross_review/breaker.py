@@ -3,12 +3,22 @@
 審查失敗時每一輪都重試是有害的：每次都再燒一次額度、再等一次、
 再產生一次噪音，而且永遠不會自己停。
 
-狀態刻意放在 breaker.json 而不是 state.json：hook 與背景審查是兩個行程，
-各自讀寫同一個檔案會互相覆蓋。分開就沒有這個問題。
+## 為什麼狀態要拆成好幾個檔案
 
-失敗計數是**分模式**的。共用一份計數的話，程式碼審查每輪失敗、
-視覺審查每輪成功，成功那邊會把計數清零，於是永遠累積不到門檻——
-斷路器等於不存在。（第 29 回合審查發現，實際存在於程式碼中。）
+「讀出整份 → 改 → 整份寫回」在有第二個寫入者時就是競態。這個工具有
+**三個**會動狀態的行程：hook、程式碼審查、視覺審查。後兩者是併行的。
+
+第一次拆檔（從 state.json 拆出 breaker.json）只解決了 hook 與審查之間的
+衝突，漏了「背景審查自己就有兩個行程」。實測重現過：code 記下額度暫停之後，
+visual 用它更早的快照整份寫回，暫停就消失了——而額度用完時兩個審查
+幾乎同時失敗，所以那正是這個競態的典型情況，不是窄窗。
+
+所以現在的規則是**每個檔案只有一個寫入者**：
+
+* `breaker.<模式>.json`  只有那個模式會寫（失敗計數、該模式的暫停）
+* `breaker.json`         全域的額度／限流暫停。兩個模式都可能寫，但寫進去的
+                         是同一件事實（伺服器什麼時候讓我們再試），
+                         互相覆蓋不會失真。
 """
 from __future__ import annotations
 
@@ -34,49 +44,45 @@ _RESET_AT = re.compile(r"try again at\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])?")
 MAX_FAILURES = 3          # 連續失敗幾次才跳閘（單次可能只是網路抖動）
 COOLDOWN_SEC = 3600       # 非額度類失敗的冷卻時間
 
-# 時間到才會解除的暫停種類。這兩種都是伺服器端的限制，
-# 「另一個模式剛好成功了」不構成解除的理由——那次成功很可能是在
-# 額度耗盡之前就派出去的，拿它來解除等於立刻再燒一次。
-_TIME_ONLY = ("quota", "rate")
+_KNOWN_MODES = ("code", "visual")
 
 
-def _path(project: Path) -> Path:
+def _global_path(project: Path) -> Path:
     return common.review_dir(project) / "breaker.json"
 
 
-def load(project: Path) -> dict:
-    data = common.read_json(_path(project))
+def _mode_path(project: Path, mode: str) -> Path:
+    return common.review_dir(project) / ("breaker." + str(mode) + ".json")
+
+
+def _load_global(project: Path) -> dict:
+    data = common.read_json(_global_path(project))
     if not isinstance(data, dict):
         data = {}
-    fails = data.get("failures")
-    if not isinstance(fails, dict):
-        # 舊格式只有一個共用計數。搬過來當成兩個模式的起點，不要直接丟掉。
-        old = data.get("consecutive_failures")
-        old = int(old) if isinstance(old, int) else 0
-        fails = {"code": old, "visual": old}
-    data["failures"] = {k: (int(v) if isinstance(v, int) else 0)
-                        for k, v in fails.items()}
-    # 全域暫停：額度／限流。這是帳號層級的限制，擋掉所有模式。
-    data.setdefault("paused_until", 0.0)
-    data.setdefault("pause_kind", "")
-    data.setdefault("reason", "")
-    # 各模式自己的暫停：連續失敗造成的。原本這三個欄位是共用的一組，
-    # code 跳閘之後 visual 也跳閘會蓋掉前一組——code 明明還在壞卻提前恢復。
-    # 失敗計數分了模式，暫停狀態卻沒分，等於只做了一半。
-    pauses = data.get("mode_pause")
-    if not isinstance(pauses, dict):
-        pauses = {}
-    if data.get("pause_kind") == "failures":
-        # 舊格式：那一組共用欄位搬進它原本屬於的模式，不要直接丟掉。
-        pauses[str(data.get("pause_mode") or "code")] = {
-            "until": float(data.get("paused_until") or 0),
-            "reason": str(data.get("reason") or ""),
-        }
-        data["paused_until"] = 0.0
-        data["pause_kind"] = ""
-    data["mode_pause"] = {k: v for k, v in pauses.items() if isinstance(v, dict)}
-    data.pop("pause_mode", None)
-    return data
+    return {
+        "paused_until": _float(data.get("paused_until")),
+        "pause_kind": str(data.get("pause_kind") or ""),
+        "reason": str(data.get("reason") or ""),
+    }
+
+
+def _load_mode(project: Path, mode: str) -> dict:
+    data = common.read_json(_mode_path(project, mode))
+    if not isinstance(data, dict):
+        data = {}
+    failures = data.get("failures")
+    return {
+        "failures": failures if isinstance(failures, int) and failures >= 0 else 0,
+        "paused_until": _float(data.get("paused_until")),
+        "reason": str(data.get("reason") or ""),
+    }
+
+
+def _float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def is_quota_error(message: str) -> bool:
@@ -113,55 +119,57 @@ def _stamp(until: float) -> str:
     return datetime.fromtimestamp(until).strftime("%m/%d %H:%M")
 
 
+def _note(scope: str, until: float, reason) -> str:
+    return ("cross-review：" + scope + "暫停中，" + _stamp(until)
+            + " 自動恢復。原因：" + str(reason or "未記錄")[:200]
+            + "（要立刻恢復就刪掉 .claude/review/breaker*.json）")
+
+
 def record_failure(project: Path, message: str, mode: str = "code") -> str:
     """記一次失敗，必要時跳閘。回傳要告訴使用者的話（沒事就是空字串）。"""
-    data = load(project)
-    data["failures"][mode] = int(data["failures"].get(mode, 0)) + 1
+    mode = str(mode or "code")
+    data = _load_mode(project, mode)
+    data["failures"] += 1
     data["reason"] = str(message)[:500]
     note = ""
 
     reset_at = parse_reset_time(message)
-    if is_quota_error(message):
-        # 額度用完不必等三次——再試也是白試，而且訊息裡就寫了恢復時間。
+    quota = is_quota_error(message)
+    if quota or (_RATE.search(message or "") and reset_at):
+        # 帳號層級的限制，擋掉所有模式。寫進全域檔——另一個模式也可能同時
+        # 寫同一件事實，互相覆蓋不會失真。
         until = reset_at or (time.time() + COOLDOWN_SEC)
-        data["paused_until"] = until
-        data["pause_kind"] = "quota"
-        data["pause_mode"] = ""
-        note = "額度已用完，審查暫停到 " + _stamp(until) + "（時間到自動恢復）"
-    elif _RATE.search(message or "") and reset_at:
-        data["paused_until"] = reset_at
-        data["pause_kind"] = "rate"
-        data["pause_mode"] = ""
-        note = "被限流，審查暫停到 " + _stamp(reset_at) + "（時間到自動恢復）"
-    elif data["failures"][mode] >= MAX_FAILURES:
-        until = time.time() + COOLDOWN_SEC
-        data["mode_pause"][mode] = {"until": until, "reason": str(message)[:500]}
-        note = ("「" + mode + "」連續 " + str(data["failures"][mode])
+        common.write_json(_global_path(project), {
+            "paused_until": until,
+            "pause_kind": "quota" if quota else "rate",
+            "reason": str(message)[:500],
+        })
+        note = (("額度已用完，審查暫停到 " if quota else "被限流，審查暫停到 ")
+                + _stamp(until) + "（時間到自動恢復）")
+    elif data["failures"] >= MAX_FAILURES:
+        data["paused_until"] = time.time() + COOLDOWN_SEC
+        note = ("「" + mode + "」連續 " + str(data["failures"])
                 + " 次審查失敗，這個模式暫停 " + str(COOLDOWN_SEC // 60)
                 + " 分鐘（時間到自動恢復）")
 
-    common.write_json(_path(project), data)
+    common.write_json(_mode_path(project, mode), data)
     if note:
         common.log_error(project, "斷路器跳閘：" + note + "。最後的錯誤：" + str(message)[:300])
     return note
 
 
 def record_success(project: Path, mode: str = "code") -> None:
-    """成功一次就把**這個模式**的計數歸零。
+    """成功一次就把**這個模式**的計數與暫停歸零。
 
-    只解除由這個模式的連續失敗造成的暫停。額度／限流的暫停一律只有
-    時間能解除：那是帳號層級的限制，跟哪個模式成功無關，而且併行派工時
-    後完成的那個成功會剛好把前一個的額度暫停清掉。
+    絕不碰全域檔。額度／限流的暫停只有時間能解除：那是帳號層級的限制，
+    跟哪個模式成功無關，而且併行派工時，後完成的那個成功很可能是在額度
+    耗盡之前就送出去的，拿它來解除等於立刻再燒一次。
     """
-    data = load(project)
-    changed = False
-    if data["failures"].get(mode):
-        data["failures"][mode] = 0
-        changed = True
-    if data["mode_pause"].pop(mode, None):
-        changed = True
-    if changed:
-        common.write_json(_path(project), data)
+    mode = str(mode or "code")
+    data = _load_mode(project, mode)
+    if data["failures"] or data["paused_until"]:
+        common.write_json(_mode_path(project, mode),
+                          {"failures": 0, "paused_until": 0.0, "reason": ""})
 
 
 def paused_note(project: Path, mode: str = None) -> str:
@@ -173,20 +181,12 @@ def paused_note(project: Path, mode: str = None) -> str:
     暫停期間每一輪都講一次。這件事寧可吵也不能忘記——
     「審查停著」跟「審查通過」在畫面上長得一模一樣。
     """
-    data = load(project)
     now = time.time()
-    if float(data.get("paused_until") or 0) > now:
-        # 額度／限流是帳號層級的，擋掉每一個模式。
-        return _note("審查", float(data["paused_until"]), data.get("reason"))
-    for name in ([mode] if mode else sorted(data["mode_pause"])):
-        entry = data["mode_pause"].get(name) or {}
-        if float(entry.get("until") or 0) > now:
-            return _note("「" + str(name) + "」審查",
-                         float(entry["until"]), entry.get("reason"))
+    g = _load_global(project)
+    if g["paused_until"] > now:
+        return _note("審查", g["paused_until"], g["reason"])
+    for name in ([str(mode)] if mode else _KNOWN_MODES):
+        data = _load_mode(project, name)
+        if data["paused_until"] > now:
+            return _note("「" + name + "」審查", data["paused_until"], data["reason"])
     return ""
-
-
-def _note(scope: str, until: float, reason) -> str:
-    return ("cross-review：" + scope + "暫停中，" + _stamp(until)
-            + " 自動恢復。原因：" + str(reason or "未記錄")[:200]
-            + "（要立刻恢復就刪掉 .claude/review/breaker.json）")
