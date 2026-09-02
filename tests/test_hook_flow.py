@@ -1573,12 +1573,12 @@ def scenario_breaker_and_usage(base: Path) -> None:
     rdir7 = proj7 / ".claude" / "review"
     # visual 沒有失敗過，所以不會有它的檔案——record_success() 對一份
     # 本來就乾淨的狀態不寫入。要驗的是「code 的計數寫在自己的檔案裡」。
-    check("失敗計數寫在各模式自己的檔案裡",
-          (rdir7 / "breaker.code.json").exists(),
-          sorted(f.name for f in rdir7.glob("breaker*.json")))
+    check("每個模式一份只追加的事件記錄",
+          (rdir7 / "breaker.code.log").exists(),
+          sorted(f.name for f in rdir7.glob("breaker*")))
     check("沒有任何共用的狀態檔",
           not (rdir7 / "breaker.json").exists(),
-          sorted(f.name for f in rdir7.glob("breaker*.json")))
+          sorted(f.name for f in rdir7.glob("breaker*")))
 
     # 兩個模式解析到的恢復時間不一定相同：一邊從訊息拿到明確時刻，另一邊
     # 沒拿到而用一小時兜底。共寫一個檔的話，後寫的兜底值會把期限蓋短。
@@ -1606,7 +1606,7 @@ def scenario_breaker_and_usage(base: Path) -> None:
     common.write_json(proj9 / ".claude" / "review" / "breaker.json",
                       {"paused_until": time.time() + 3600, "pause_kind": "quota",
                        "reason": "額度"})
-    (proj9 / ".claude" / "review" / "breaker.code.json").unlink(missing_ok=True)
+    (proj9 / ".claude" / "review" / "breaker.code.log").unlink(missing_ok=True)
     check("舊格式的額度暫停仍擋所有模式",
           breaker.paused_note(proj9, "visual") != "",
           breaker.paused_note(proj9, "visual"))
@@ -1638,18 +1638,45 @@ def scenario_breaker_and_usage(base: Path) -> None:
           breaker.paused_note(proj11, "code") == kept,
           (kept, breaker.paused_note(proj11, "code")))
 
-    # 成功行程讀完狀態之後、寫回之前，另一個同模式的行程又記了失敗。
-    # 舊的成功不該把新的失敗抹掉——寫回時只清「自己讀到的那些」。
+    # 三個同模式行程交錯：舊成功讀到 2 次失敗 → 另一個成功先歸零 →
+    # 出現 1 次新失敗 → 舊成功最後寫回。合併式的狀態檔會把新失敗算成
+    # max(0, 1 - 2) = 0 而抹掉它；只追加的記錄沒有「寫回」這個動作，
+    # 所以不存在這種交錯。這裡開真的行程來驗，不是模擬。
     proj12 = base / "breakerproj12"
     (proj12 / ".claude" / "review").mkdir(parents=True)
+    driver = (
+        "import sys;sys.path.insert(0, sys.argv[1]);"
+        "from pathlib import Path;from cross_review import breaker;"
+        "breaker.record_failure(Path(sys.argv[2]), sys.argv[3], sys.argv[4])"
+        " if sys.argv[3] else breaker.record_success(Path(sys.argv[2]), sys.argv[4])")
+    procs = []
+    for msg in ("boom", "boom", "", "boom"):
+        procs.append(subprocess.Popen(
+            [sys.executable, "-c", driver, str(TOOL_ROOT), str(proj12), msg, "code"]))
+    for q in procs:
+        q.wait()
+    events = breaker._events(proj12, "code")
+    check("併行寫入不會遺失任何事件",
+          len(events) == 4, [e.get("ok") for e in events])
+    check("每一行都是完整的 JSON",
+          all(isinstance(e, dict) and "t" in e for e in events), events)
+
+    # 成功之後的失敗才算連續，而且是用讀的推導，不是寫回時決定的。
+    proj12b = base / "breakerproj12b"
+    (proj12b / ".claude" / "review").mkdir(parents=True)
     for _ in range(2):
-        breaker.record_failure(proj12, "boom", "code")
-    stale = breaker._load_mode(proj12, "code")      # 成功行程此刻讀到的狀態
-    breaker.record_failure(proj12, "boom", "code")  # 第 3 次 → 模式暫停成立
-    breaker._write_mode(proj12, "code", stale, reset=True)
-    check("成功不會抹掉它讀完之後才出現的模式暫停",
-          breaker.paused_note(proj12, "code") != "",
-          breaker.paused_note(proj12, "code"))
+        breaker.record_failure(proj12b, "boom", "code")
+    breaker.record_success(proj12b, "code")
+    for _ in range(2):
+        breaker.record_failure(proj12b, "boom", "code")
+    check("成功之前的失敗不算進連續計數",
+          breaker.paused_note(proj12b, "code") == "",
+          breaker.paused_note(proj12b, "code"))
+    note12 = breaker.record_failure(proj12b, "連線逾時", "code")
+    check("成功之後累積到門檻才跳閘", bool(note12), repr(note12))
+    check("模式暫停的原因不會變成「未記錄」",
+          "連線逾時" in breaker.paused_note(proj12b, "code"),
+          breaker.paused_note(proj12b, "code"))
 
     # 期限來自舊版的額度限制時，原因也要跟著它走。模式檔裡留著更早的一般
     # 錯誤的話，訊息會變成「因為連線逾時所以等到 13:27」，使用者判斷不了
