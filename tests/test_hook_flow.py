@@ -1392,17 +1392,41 @@ def scenario_referenced_context(base: Path) -> None:
           any("拆檔案" in x for x in parsed_real["referenced_context"]),
           parsed_real["referenced_context"])
 
-    # 否定的指代不可以收——收了材料包會宣稱「使用者已經同意」，
-    # 等於把明確否決的方案反向列成驗收需求。
-    for word in ("不要照做", "我不同意你的建議", "don't do it"):
+    # 又否定又肯定（「第一項不要，其他照做」）原本會被整句丟掉，審查者連
+    # 「部分採用」的脈絡都沒有。現在一律保留脈絡，安全性靠材料包的措辭：
+    # 它不宣稱使用者同意，只說「這是使用者在回應的東西，以他的原文為準」。
+    for word in ("不要照做", "第一項不要，其他照做", "不用等了，照做"):
         rows_n = rows[:2] + [{"type": "user",
                               "message": {"role": "user", "content": word}}]
         tn = base / ("refneg_" + str(abs(hash(word)) % 10000) + ".jsonl")
         tn.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows_n),
                       encoding="utf-8")
-        check("否定的指代不收：" + word,
-              tx.parse(tn, 0)["referenced_context"] == [],
+        check("否定或部分採用時仍保留脈絡：" + word,
+              tx.parse(tn, 0)["referenced_context"] != [],
               tx.parse(tn, 0)["referenced_context"])
+
+    # 措辭是這個設計的安全來源，所以要驗它。
+    from cross_review.review import add_user_voice
+    rendered_lines = []
+    add_user_voice(lambda s="": rendered_lines.append(s),
+                   {"user_requests": ["不要照做"],
+                    "referenced_context": ["我建議三件事"]}, {})
+    rendered = "\n".join(rendered_lines)
+    check("材料包不會宣稱使用者同意了那段內容",
+          "已經同意" not in rendered and "以上面他的原文為準" in rendered,
+          rendered[:200])
+
+    # 使用者實際說的是「動手」，不是「可以動手」。白名單漏了這個詞，
+    # 連續三輪失效——長度判準才是可靠的那一個。
+    for word in ("動手", "繼續", "都做", "好"):
+        rows_s2 = rows[:2] + [{"type": "user",
+                               "message": {"role": "user", "content": word}}]
+        t_s = base / ("refshort_" + str(abs(hash(word)) % 10000) + ".jsonl")
+        t_s.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows_s2),
+                       encoding="utf-8")
+        check("極短的回應一律視為指代：" + word,
+              tx.parse(t_s, 0)["referenced_context"] != [],
+              tx.parse(t_s, 0)["referenced_context"])
 
     # 助手訊息的 content 可能是字串而不是 block 陣列。只處理陣列的話，
     # 不但抓不到，還會留著更早那一則，指代指向錯誤的內容。
@@ -1421,11 +1445,12 @@ def scenario_referenced_context(base: Path) -> None:
           got_s and "新的建議" in got_s[0], got_s)
 
     rows2 = rows[:2] + [{"type": "user",
-                         "message": {"role": "user", "content": "改成藍色"}}]
+                         "message": {"role": "user", "content":
+        "把首頁的標題字級改成 18px，並且把側邊欄背景換成深灰色"}}]
     t2 = base / "refctx2.jsonl"
     t2.write_text("\n".join(
         json.dumps(r, ensure_ascii=False) for r in rows2), encoding="utf-8")
-    check("沒有指代就不收，材料包不會白白變大",
+    check("夠長而且自帶需求的發言不收，材料包不會白白變大",
           tx.parse(t2, 0)["referenced_context"] == [],
           tx.parse(t2, 0)["referenced_context"])
 
@@ -1445,7 +1470,6 @@ def scenario_referenced_context(base: Path) -> None:
 
 
 def scenario_breaker_and_usage(base: Path) -> None:
-    from cross_review import common
     """斷路器與用量帳本。錯誤訊息是 2026-09-02 額度真的用完時擷取的原文。"""
     sys.path.insert(0, str(TOOL_ROOT))
     from cross_review import breaker, common, usage
@@ -1583,6 +1607,33 @@ def scenario_breaker_and_usage(base: Path) -> None:
     check("舊格式的額度暫停仍擋所有模式",
           breaker.paused_note(proj9, "visual") != "",
           breaker.paused_note(proj9, "visual"))
+
+    # 升級的實際組合：上上一版同時寫模式檔與共用的 breaker.json，所以一個
+    # 在那個版本上遇到額度用完的專案，兩種檔案會同時存在。只在模式檔缺席時
+    # 才讀舊檔的話，那個仍然有效的暫停會被靜默丟掉然後提前再送一次審。
+    proj10 = base / "breakerproj10"
+    r10 = proj10 / ".claude" / "review"
+    r10.mkdir(parents=True)
+    common.write_json(r10 / "breaker.json",
+                      {"paused_until": time.time() + 3600,
+                       "pause_kind": "quota", "reason": "額度用完"})
+    for m in ("code", "visual"):
+        common.write_json(r10 / ("breaker." + m + ".json"),
+                          {"failures": 0, "paused_until": 0.0, "reason": ""})
+    check("模式檔與舊全域檔同時存在時，舊的額度暫停仍生效",
+          breaker.paused_note(proj10, "code") != "",
+          breaker.paused_note(proj10, "code"))
+
+    # 同一個模式仍可能有兩個行程（上一輪還在跑、下一輪又派了一次）。
+    # 寫入前取最大值，讓競態最多少加一次計數，不會讓已生效的暫停消失。
+    proj11 = base / "breakerproj11"
+    (proj11 / ".claude" / "review").mkdir(parents=True)
+    breaker.record_failure(proj11, REAL, "code")          # 行程 A：額度暫停
+    kept = breaker.paused_note(proj11, "code")
+    breaker.record_success(proj11, "code")                # 行程 B：成功歸零
+    check("成功歸零不會把帳號層級的暫停一起清掉",
+          breaker.paused_note(proj11, "code") == kept,
+          (kept, breaker.paused_note(proj11, "code")))
 
     # 短暫限流沒有恢復時間就不該當成額度耗盡而停一小時。
     proj4 = base / "breakerproj4"

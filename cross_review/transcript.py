@@ -60,18 +60,34 @@ def _clean_user_text(text: str) -> str:
     return _COMMAND_TAGS.sub("", text).strip()
 
 
-# 使用者用來指涉「執行者上一則回覆」的說法。命中才會把那則回覆收進材料包，
-# 所以寧可窄一點：誤收的代價是材料包變大，漏收的代價是審查者看不懂需求。
+# 使用者用來指涉「執行者上一則回覆」的說法。
+#
+# 光靠這份清單是不夠的，而且不是「再補幾個詞」就能解決：實測連續三輪失效，
+# 第三輪的原因是使用者說的是「動手」而清單裡只有「可以動手」。真實用語
+# 有無限多種寫法，白名單永遠會漏。
+#
+# 真正可靠的判準是**長度**：一句「動手」「繼續」「都做」本身載不動任何需求，
+# 所以它必然是在回應前面的東西。長句子才需要靠關鍵詞判斷。
 _REFERENTIAL = re.compile(
     "你的建議|你說的|你提的|你列的|依照你|照你|按你|如你所說"
     "|可以動手|可以執行|就這樣做|照做|都採用|採用你|同意你"
     "|第[ ]*[0-9]+[ ]*項|那幾項|上面那"
     "|your (recommendation|suggestion)|as you (suggested|said)"
     "|go ahead|do it", re.I)
-# 否定的指代。命中就不收——「不要照做」「我不同意你的建議」原本會被
-# _REFERENTIAL 命中，材料包接著宣稱「使用者已經同意」，等於把明確否決的
-# 方案反向列成驗收需求。那比不做這個功能更糟。
-# 這裡刻意寧可漏收：漏收只是審查者少一份脈絡，誤收是把意思講反。
+# 這個樣式現在只用來提醒，不用來否決。
+#
+# 原本是「命中就整句不收」，但「第一項不要，其他照做」這種又否定又肯定的
+# 說法會被整個丟掉，審查者於是連「部分採用」的脈絡都沒有。
+#
+# 真正的問題從來不是收不收，而是材料包**怎麼描述**它：原本寫的是
+# 「使用者已經同意以下內容」，那才會把否決講成同意。改成中性的說法
+# （「使用者這句話是在回應以下內容，同意了哪些以他的原文為準」）之後，
+# 收進來一律安全，否決的情況反而更需要這份脈絡。
+# 短到這個長度以下的發言，本身不可能是完整的需求，一律視為指代。
+_SHORT_REPLY_CHARS = 16
+
+# 保留這個樣式只為了一件事：長句子裡的指代（「依照你上面列的第 2 項」）。
+# 它**不再**用來否決——否決的邏輯已經拿掉了，理由見 _NEGATED 的說明。
 _NEGATED = re.compile(
     "不要|不用|不必|別[這那照]|不同意|不採用|不接受|不需要|沒有要|先不|暫不|"
     "先別|等一下|再想|"
@@ -196,7 +212,7 @@ def parse(transcript_path: Path, start_line: int = 0, stop_line: int = 0) -> dic
                 text = _clean_user_text(raw_text)
                 if text:
                     result["user_requests"].append(text)
-                    if _REFERENTIAL.search(text) and not _NEGATED.search(text):
+                    if len(text.strip()) <= _SHORT_REPLY_CHARS or                             _REFERENTIAL.search(text):
                         said = last_assistant or _assistant_text_before(
                             transcript_path, start_line)
                         if said:

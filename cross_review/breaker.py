@@ -93,16 +93,64 @@ def _from_legacy(project: Path, mode: str) -> dict:
 
 
 def _load_mode(project: Path, mode: str) -> dict:
+    legacy = _from_legacy(project, mode)
     data = common.read_json(_mode_path(project, mode))
     if not isinstance(data, dict) or not data:
-        return _from_legacy(project, mode)
+        return legacy
     failures = data.get("failures")
-    return {
+    out = {
         "failures": failures if isinstance(failures, int) and failures >= 0 else 0,
         "paused_until": _float(data.get("paused_until")),
         "account_until": _float(data.get("account_until")),
         "reason": str(data.get("reason") or ""),
     }
+    # 舊版的帳號層級暫停**一定**要繼續生效，不能只在模式檔不存在時才看。
+    # 上上一版（4497c97）同時寫模式檔與共用的 breaker.json，所以一個在那個
+    # 版本上遇到額度用完的專案，升級後兩種檔案會同時存在——只在模式檔缺席時
+    # 才讀舊檔的話，那個仍然有效的暫停會被靜默丟掉，然後提前再送一次審。
+    if legacy["account_until"] > out["account_until"]:
+        out["account_until"] = legacy["account_until"]
+        if not out["reason"]:
+            out["reason"] = legacy["reason"]
+    return out
+
+
+def _write_mode(project: Path, mode: str, data: dict, reset: bool = False) -> None:
+    """寫回這個模式的狀態，寫之前先跟磁碟上的內容取最大值。
+
+    「每個模式一個檔」還不足以保證單一寫入者：上一輪的審查可能還在跑
+    （最久 11 分鐘），下一輪又派了同一個模式，於是兩個 code 行程同時在
+    讀改寫同一個檔案。
+
+    **這不是原子操作，只是把丟失更新的方向壓到安全的一側**：暫停期限一律
+    取較大者，所以競態最多讓失敗次數少加一次，不會讓已經生效的暫停消失。
+    真正的原子性需要檔案鎖，代價與這個風險不成比例。
+
+    `reset=True` 是成功時用的，會把自己的計數與暫停歸零——這是有意的覆寫，
+    但帳號層級的暫停仍然取最大值，因為那只有時間能解除。
+    """
+    current = common.read_json(_mode_path(project, mode))
+    if not isinstance(current, dict):
+        current = {}
+    merged = {
+        "failures": 0 if reset else max(
+            int(data.get("failures") or 0),
+            int(current.get("failures") or 0) if isinstance(
+                current.get("failures"), int) else 0),
+        "paused_until": 0.0 if reset else max(
+            _float(data.get("paused_until")), _float(current.get("paused_until"))),
+        "account_until": max(
+            _float(data.get("account_until")), _float(current.get("account_until"))),
+        "reason": str(data.get("reason") or ""),
+    }
+    if reset:
+        # 自己的計數與暫停歸零是有意的，但帳號層級的暫停還在的話，
+        # 原因不能一起清掉——訊息會變成「原因：未記錄」，使用者看不出
+        # 是額度用完還是別的，也就不知道該等還是該查。
+        merged["reason"] = ("" if merged["account_until"] <= time.time()
+                            else (str(current.get("reason") or "")
+                                  or str(data.get("reason") or "")))
+    common.write_json(_mode_path(project, mode), merged)
 
 
 def is_quota_error(message: str) -> bool:
@@ -168,7 +216,7 @@ def record_failure(project: Path, message: str, mode: str = "code") -> str:
                 + " 次審查失敗，這個模式暫停 " + str(COOLDOWN_SEC // 60)
                 + " 分鐘（時間到自動恢復）")
 
-    common.write_json(_mode_path(project, mode), data)
+    _write_mode(project, mode, data)
     if note:
         common.log_error(project, "斷路器跳閘：" + note + "。最後的錯誤：" + str(message)[:300])
     return note
@@ -184,12 +232,7 @@ def record_success(project: Path, mode: str = "code") -> None:
     mode = str(mode or "code")
     data = _load_mode(project, mode)
     if data["failures"] or data["paused_until"]:
-        common.write_json(_mode_path(project, mode), {
-            "failures": 0,
-            "paused_until": 0.0,
-            "account_until": data["account_until"],
-            "reason": "",
-        })
+        _write_mode(project, mode, data, reset=True)
 
 
 def paused_note(project: Path, mode: str = None) -> str:
