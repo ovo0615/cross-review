@@ -37,6 +37,9 @@ def record(project: Path, mode: str, round_no: int, data: dict,
         "dossier_bytes": dossier_bytes,
         "findings": len(data.get("findings") or []),
         "blocking": bool(data.get("blocking")),
+        # 這一趟到底有沒有跑成。失敗的那幾趟也要進帳本（額度照燒），
+        # 但彙總時要看得出來哪些是白花的。
+        "ok": not data.get("_failed"),
     }
     try:
         path = _path(project)
@@ -58,12 +61,27 @@ def read_rows(project: Path) -> list:
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                obj = json.loads(line)
             except Exception:
                 continue          # 壞掉的一行不該讓整份帳本讀不出來
+            if not isinstance(obj, dict):
+                # `null`、陣列、數字都是合法 JSON 卻不是一筆紀錄。
+                # 只擋 JSONDecodeError 的話，這種行會一路帶到 summary()
+                # 的 r.get() 那裡才炸掉——註解說會略過壞行，實際上是崩潰。
+                continue
+            rows.append(obj)
     except Exception:
         return []
     return rows
+
+
+def _num(value, default=0):
+    """帳本裡的欄位型別不保證正確（手改過、程式換過版）。
+    直接 int()/float() 一個字串就是整份彙總崩掉，寧可當成 0。"""
+    try:
+        return type(default)(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def summary(project: Path) -> str:
@@ -71,8 +89,8 @@ def summary(project: Path) -> str:
     if not rows:
         return "還沒有任何用量紀錄（" + str(_path(project)) + " 不存在或是空的）。"
 
-    total = sum(int(r.get("tokens") or 0) for r in rows)
-    secs = sum(float(r.get("seconds") or 0) for r in rows)
+    total = sum(_num(r.get("tokens"), 0) for r in rows)
+    secs = sum(_num(r.get("seconds"), 0.0) for r in rows)
     lines = [
         "用量彙總：" + str(project),
         "",
@@ -86,8 +104,8 @@ def summary(project: Path) -> str:
         key = (r.get("model") or "?") + " / " + (r.get("effort") or "?")
         acc = by_model.setdefault(key, {"n": 0, "tok": 0, "sec": 0.0})
         acc["n"] += 1
-        acc["tok"] += int(r.get("tokens") or 0)
-        acc["sec"] += float(r.get("seconds") or 0)
+        acc["tok"] += _num(r.get("tokens"), 0)
+        acc["sec"] += _num(r.get("seconds"), 0.0)
     for key in sorted(by_model, key=lambda k: -by_model[k]["tok"]):
         a = by_model[key]
         lines.append("%-12s %5d %14s %12s %8.0f"
@@ -98,8 +116,8 @@ def summary(project: Path) -> str:
     for r in rows[-5:]:
         lines.append("  %s  #%-3s %-7s %8s tokens  材料包 %5.1f KB  發現 %d%s"
                      % (r.get("at", "?"), r.get("round", "?"), r.get("mode", "?"),
-                        format(int(r.get("tokens") or 0), ","),
-                        int(r.get("dossier_bytes") or 0) / 1024,
-                        int(r.get("findings") or 0),
+                        format(_num(r.get("tokens"), 0), ","),
+                        _num(r.get("dossier_bytes"), 0) / 1024,
+                        _num(r.get("findings"), 0),
                         "（攔阻）" if r.get("blocking") else ""))
     return "\n".join(lines)

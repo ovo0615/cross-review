@@ -108,12 +108,6 @@ def main() -> int:
     if not cfg.get("enabled", True):
         return 0
 
-    # 斷路器跳閘中就不要再送審——每次重試都是再燒一次額度然後再失敗一次。
-    # 但一定要講出來：「審查停著」跟「審查通過」在畫面上長得一模一樣。
-    paused = breaker.paused_note(project)
-    if paused:
-        passthrough(paused)
-
     modes = []
     if cfg.get("visual_review", True) and cfg.get("shots"):
         modes.append("visual")   # 快的排前面（ADR-0003）
@@ -121,6 +115,16 @@ def main() -> int:
         modes.append("code")
     if not modes:
         return 0  # 兩種審查都關掉了，這個專案等於停用
+
+    # 斷路器跳閘中就不要再送審——每次重試都是再燒一次額度然後再失敗一次。
+    # 但一定要講出來：「審查停著」跟「審查通過」在畫面上長得一模一樣。
+    # 額度／限流的暫停擋掉所有模式；某個模式自己連續失敗造成的暫停只擋它自己，
+    # 程式碼審查壞掉不該連帶讓視覺審查也停下來。
+    pause_notes = [note for note in
+                   (breaker.paused_note(project, m) for m in modes) if note]
+    modes = [m for m in modes if not breaker.paused_note(project, m)]
+    if not modes:
+        passthrough(pause_notes[0])
 
     state = common.load_state(project)
     if state.get("transcript") != transcript_path:
@@ -277,7 +281,11 @@ def main() -> int:
     }
     common.save_state(project, state)
 
-    block(build_reason(job_path, files + fresh_deletions, project, modes))
+    reason = build_reason(job_path, files + fresh_deletions, project, modes)
+    if pause_notes:
+        # 部分暫停：還是要派工，但不能讓「有一種審查停著」這件事消失。
+        reason = pause_notes[0] + "\n\n" + reason
+    block(reason)
     return 0
 
 

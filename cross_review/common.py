@@ -495,13 +495,19 @@ def resolve_codex():
 
 def run_codex(project: Path, prompt: str, schema_file: Path, out_file: Path,
               cfg: dict, images=None, require=None):
-    """跑一趟審查。回傳 (解析出的 dict, 錯誤訊息)。
+    """跑一趟審查。回傳 (dict, 錯誤訊息)。
+
+    **失敗時第一個回傳值不是 None，而是一份只有 `_` 開頭事實欄位的 dict**
+    （`_tokens`、`_elapsed_sec`、`_failed`），因為失敗那一趟也燒了額度：
+    實際發生過的額度錯誤訊息裡就寫著 `tokens used / 35,477`，那 3.5 萬個
+    token 是真的花掉了，只記成功的話，帳本會在最需要分析額度的時候少算。
+    呼叫端一律先看第二個回傳值判斷成功與否，不要拿 dict 是不是 None 來判斷。
 
     永遠是唯讀沙箱：審查者不得改任何檔案。
     """
     codex = resolve_codex()
     if not codex:
-        return None, "找不到 codex.exe（%LOCALAPPDATA%\\OpenAI\\Codex\\bin\\*\\codex.exe）"
+        return {}, "找不到 codex.exe（%LOCALAPPDATA%\\OpenAI\\Codex\\bin\\*\\codex.exe）"
 
     if out_file.exists():
         out_file.unlink()
@@ -533,19 +539,28 @@ def run_codex(project: Path, prompt: str, schema_file: Path, out_file: Path,
             cmd, input=prompt.encode("utf-8"), capture_output=True, timeout=timeout
         )
     except subprocess.TimeoutExpired:
-        return None, "codex 逾時（" + str(timeout) + " 秒）"
+        # 逾時看不到輸出，拿不到 token 數；秒數還是要記，那是實際等掉的時間。
+        return {"_elapsed_sec": round(float(timeout), 1), "_failed": True}, \
+            "codex 逾時（" + str(timeout) + " 秒）"
     elapsed = time.time() - started
 
     tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+    # 標頭（model、reasoning effort、tokens used）寫在 stderr，不是 stdout。
+    facts = parse_run_facts(
+        proc.stdout.decode("utf-8", "replace")
+        + "\n"
+        + proc.stderr.decode("utf-8", "replace"))
+    facts["_elapsed_sec"] = round(elapsed, 1)
+    facts["_failed"] = True
     if not out_file.exists():
-        return None, (
+        return facts, (
             "codex 結束（exit " + str(proc.returncode) + "，"
             + format(elapsed, ".0f") + " 秒）但沒有輸出：" + " / ".join(tail)
         )
     # 非零離開碼即使留下了合法 JSON 也不算成功。原本只檢查檔案存不存在、
     # 解不解得開，等於把中途失敗的殘留輸出當成一份完整審查。
     if proc.returncode != 0:
-        return None, (
+        return facts, (
             "codex 以 exit " + str(proc.returncode) + " 結束（"
             + format(elapsed, ".0f") + " 秒），輸出不採信：" + " / ".join(tail)
         )
@@ -553,29 +568,24 @@ def run_codex(project: Path, prompt: str, schema_file: Path, out_file: Path,
     try:
         data = json.loads(read_text(out_file))
     except Exception as exc:
-        return None, "codex 的輸出不是合法 JSON：" + str(exc)
+        return facts, "codex 的輸出不是合法 JSON：" + str(exc)
 
     if not isinstance(data, dict):
-        return None, "codex 的輸出不是物件"
+        return facts, "codex 的輸出不是物件"
 
     # --output-schema 理論上由伺服器端保證結構，但「合法 JSON 卻少欄位」
     # 會被渲染成一份空白報告，然後標記成功完成——又是假完成。
     for key, kind in (require or {}).items():
         if key not in data:
-            return None, "codex 的輸出缺少必要欄位 " + key
+            return facts, "codex 的輸出缺少必要欄位 " + key
         if not isinstance(data[key], kind):
-            return None, ("codex 的輸出欄位 " + key + " 型別不對（預期 "
+            return facts, ("codex 的輸出欄位 " + key + " 型別不對（預期 "
                           + getattr(kind, "__name__", str(kind)) + "）")
 
-    data["_elapsed_sec"] = round(elapsed, 1)
-    # 標頭（model、reasoning effort）寫在 stderr，不是 stdout。
-    # 只解析 stdout 的話，用量那一行永遠只印得出秒數——而單元測試會過，
-    # 因為餵給它的是我自己打的字串，不是真實輸出。
-    data.update(parse_run_facts(
-        proc.stdout.decode("utf-8", "replace")
-        + "\n"
-        + proc.stderr.decode("utf-8", "replace")
-    ))
+    # facts 在上面就算好了（只解析 stdout 的話用量那一行永遠只印得出秒數，
+    # 而單元測試會過，因為餵給它的是我自己打的字串，不是真實輸出）。
+    data.update(facts)
+    data["_failed"] = False
     return data, ""
 
 

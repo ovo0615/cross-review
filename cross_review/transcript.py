@@ -209,17 +209,44 @@ def diff_covers(diff_text: str, project: Path) -> set:
     """
     covered = set()
     for line in diff_text.splitlines():
-        if not line.startswith("diff --git "):
-            continue
-        # diff --git a/<path> b/<path>
-        parts = line.split(" b/", 1)
-        if len(parts) != 2:
+        rel = _diff_header_path(line)
+        if not rel:
             continue
         try:
-            covered.add(str((project / parts[1].strip()).resolve()))
+            covered.add(str((project / rel).resolve()))
         except Exception:
             pass
     return covered
+
+
+def _diff_header_path(line: str) -> str:
+    """`diff --git a/<path> b/<path>` 這一行裡的檔案路徑；不是這種行就回空字串。"""
+    if not line.startswith("diff --git "):
+        return ""
+    parts = line.split(" b/", 1)
+    if len(parts) != 2:
+        return ""
+    return parts[1].strip()
+
+
+def _diff_sections(text: str) -> list:
+    """把 diff 切成「一個檔案一段」，回傳 [(檔案相對路徑, 該段文字), ...]。
+
+    預算不夠時要丟掉的是「整個檔案的那一段」，不是「後面那幾個位元組」。
+    """
+    sections = []
+    name, buf = "", []
+    for line in text.splitlines(keepends=True):
+        header = _diff_header_path(line)
+        if header:
+            if buf:
+                sections.append((name, "".join(buf)))
+            name, buf = header, [line]
+        else:
+            buf.append(line)
+    if buf:
+        sections.append((name, "".join(buf)))
+    return sections
 
 
 def git_diff(project: Path, max_bytes: int, paths=None, base: str = "HEAD",
@@ -263,10 +290,30 @@ def git_diff(project: Path, max_bytes: int, paths=None, base: str = "HEAD",
     if proc is None or proc.returncode != 0:
         return ""
     text = proc.stdout.decode("utf-8", "replace")
-    encoded = text.encode("utf-8")
-    if len(encoded) > max_bytes:
-        text = encoded[:max_bytes].decode("utf-8", "ignore") + "\n\n[... diff 在此截斷 ...]\n"
-    return text
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+
+    # 超過預算時**不可以**從中間切。原本是直接截 max_bytes 個位元組，
+    # 於是某個檔案的標頭在切點之前、hunk 在切點之後——diff_covers() 看到
+    # 標頭就把它算成「已涵蓋」，build_code_dossier() 隨即省略它的全文，
+    # 切點之後的改動就這樣完全不進材料包，報告卻說「已由 diff 提供」。
+    # 那比不做這個最佳化更糟：以前截斷還有全文兜底，現在是靜默漏審。
+    # 改成整段整段地取，放不下的檔案完全不出現在 diff 裡，於是不會被算進
+    # covered，會照原本的路徑拿到全文。
+    kept, dropped, used = [], [], 0
+    for name, body in _diff_sections(text):
+        size = len(body.encode("utf-8"))
+        if used + size <= max_bytes:
+            kept.append(body)
+            used += size
+        else:
+            dropped.append(name or "（無法辨識的區段）")
+    out = "".join(kept)
+    if dropped:
+        out += ("\n[... 下列檔案的 diff 放不進 " + str(max_bytes)
+                + " 位元組的預算，完全沒有納入這份 diff（它們會改走全文）："
+                + "、".join(dropped) + " ...]\n")
+    return out
 
 
 def walk_code_files(project: Path, since: float) -> list:

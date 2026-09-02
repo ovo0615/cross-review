@@ -706,14 +706,18 @@ def run_code(project: Path, job: dict, cfg: dict) -> int:
     )
     if err:
         common.log_error(project, "程式碼審查失敗：" + err)
-        note = breaker.record_failure(project, err)
+        note = breaker.record_failure(project, err, "code")
+        # 失敗那一趟也燒了額度（額度錯誤訊息裡就寫著 tokens used），
+        # 不記的話帳本會在最需要分析額度的時候系統性少算。
+        usage.record(project, "code", round_no, data or {},
+                     len(dossier_text.encode("utf-8")))
         print("⚠️ 本回合的程式碼審查沒有跑成。原因：" + err)
         if note:
             print("⛔ " + note)
         print("（已記到 .claude/review/errors.log。這不是『審過了沒問題』。）")
         return 1
 
-    breaker.record_success(project)
+    breaker.record_success(project, "code")
     usage.record(project, "code", round_no, data,
                  len(dossier_text.encode("utf-8")))
 
@@ -776,14 +780,18 @@ def run_visual(project: Path, job: dict, cfg: dict) -> int:
     )
     if err:
         common.log_error(project, "視覺審查失敗：" + err)
-        note = breaker.record_failure(project, err)
+        note = breaker.record_failure(project, err, "visual")
+        # 失敗那一趟也燒了額度（額度錯誤訊息裡就寫著 tokens used），
+        # 不記的話帳本會在最需要分析額度的時候系統性少算。
+        usage.record(project, "visual", round_no, data or {},
+                     len(dossier_text.encode("utf-8")))
         print("⚠️ 本回合的視覺審查沒有跑成。原因：" + err)
         if note:
             print("⛔ " + note)
         print("（已記到 .claude/review/errors.log。這不是『畫面沒問題』。）")
         return 1
 
-    breaker.record_success(project)
+    breaker.record_success(project, "visual")
     usage.record(project, "visual", round_no, data,
                  len(dossier_text.encode("utf-8")))
 

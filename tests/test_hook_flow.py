@@ -1245,10 +1245,90 @@ def scenario_breaker_and_usage(base: Path) -> None:
           "審查暫停中" in breaker.paused_note(proj), breaker.paused_note(proj))
     check("暫停訊息含恢復時間", "自動恢復" in breaker.paused_note(proj))
 
-    # 成功一次就解除。
-    breaker.record_success(proj)
-    check("成功之後解除暫停", breaker.paused_note(proj) == "",
-          breaker.paused_note(proj))
+    # 額度暫停**只有時間**能解除。這一段原本斷言「成功一次就解除」，
+    # 那正是第 29 回合審查抓到的錯誤行為：兩種審查併行派工時，後完成的那個
+    # 成功（很可能在額度耗盡之前就送出去了）會把額度暫停清掉，於是下一輪
+    # 立刻再燒一次。測試把 bug 寫成了規格，所以改對之後這一條會失敗。
+    breaker.record_success(proj, "visual")
+    check("另一個模式成功不解除額度暫停",
+          "審查暫停中" in breaker.paused_note(proj), breaker.paused_note(proj))
+    breaker.record_success(proj, "code")
+    check("同一個模式成功也不解除額度暫停",
+          "審查暫停中" in breaker.paused_note(proj), breaker.paused_note(proj))
+
+    # 失敗計數是分模式的：視覺一直成功不該幫程式碼把計數清零。
+    proj3 = base / "breakerproj3"
+    (proj3 / ".claude" / "review").mkdir(parents=True)
+    for i in (1, 2):
+        breaker.record_failure(proj3, "boom", "code")
+        breaker.record_success(proj3, "visual")
+    note3 = breaker.record_failure(proj3, "boom", "code")
+    check("視覺的成功不會清掉程式碼的失敗計數", bool(note3), repr(note3))
+    check("連續失敗的暫停只擋壞掉的那個模式",
+          breaker.paused_note(proj3, "code") != ""
+          and breaker.paused_note(proj3, "visual") == "",
+          "code=%r visual=%r" % (breaker.paused_note(proj3, "code"),
+                                 breaker.paused_note(proj3, "visual")))
+    breaker.record_success(proj3, "code")
+    check("那個模式自己成功就解除自己的暫停",
+          breaker.paused_note(proj3, "code") == "", breaker.paused_note(proj3, "code"))
+
+    # 短暫限流沒有恢復時間就不該當成額度耗盡而停一小時。
+    proj4 = base / "breakerproj4"
+    (proj4 / ".claude" / "review").mkdir(parents=True)
+    breaker.record_failure(proj4, "Error: rate limit exceeded, please retry", "code")
+    check("限流沒帶恢復時間就當一般失敗",
+          breaker.paused_note(proj4, "code") == "", breaker.paused_note(proj4, "code"))
+    proj5 = base / "breakerproj5"
+    (proj5 / ".claude" / "review").mkdir(parents=True)
+    breaker.record_failure(proj5, "rate limit, try again at 11:59 PM", "code")
+    check("限流有帶恢復時間就照它等",
+          "自動恢復" in breaker.paused_note(proj5, "code"),
+          breaker.paused_note(proj5, "code"))
+
+    # diff 超出預算時要整個檔案整個檔案地丟。原本是直接截位元組，於是
+    # 標頭在切點前、hunk 在切點後的檔案會被 diff_covers() 算成「已涵蓋」，
+    # 全文因此被省略——切點之後的改動靜默消失，報告卻說「已由 diff 提供」。
+    from cross_review import transcript as tx
+    big = "diff --git a/big.py b/big.py\n" + "".join(
+        "-old%d\n+new%d\n" % (i, i) for i in range(400))
+    small = "diff --git a/small.py b/small.py\n-a\n+b\n"
+    secs = tx._diff_sections(big + small)
+    check("diff 切得出每個檔案一段",
+          [s[0] for s in secs] == ["big.py", "small.py"], repr([s[0] for s in secs]))
+    budget = len(big.encode("utf-8")) - 100          # 連第一個檔案都放不下
+    kept, used = [], 0
+    for name, body in secs:
+        if used + len(body.encode("utf-8")) <= budget:
+            kept.append(body)
+            used += len(body.encode("utf-8"))
+    covered = tx.diff_covers("".join(kept), base)
+    check("放不下的檔案不會被宣稱已涵蓋",
+          not any(c.endswith("big.py") for c in covered), sorted(covered))
+
+    # 失敗那一趟也燒了額度，帳本一定要記到——否則最想分析額度時剛好少算。
+    projf = base / "usagefail"
+    (projf / ".claude" / "review").mkdir(parents=True)
+    real_stderr = ("model: gpt-5.6-sol\nreasoning effort: high\n"
+                   "ERROR: You have hit your usage limit.\ntokens used: 35,477\n")
+    facts = common.parse_run_facts(real_stderr)
+    facts["_failed"] = True
+    usage.record(projf, "code", 1, facts, 51900)
+    rows = usage.read_rows(projf)
+    check("失敗的那一趟也進帳本", len(rows) == 1, rows)
+    check("失敗那趟的 tokens 有記到", rows and rows[0]["tokens"] == 35477, rows)
+    check("帳本看得出那趟是白花的", rows and rows[0]["ok"] is False, rows)
+
+    # 合法 JSON 但不是紀錄（null／陣列／數字）也要略過，不能讓 --usage 崩掉。
+    projn = base / "usagenull"
+    (projn / ".claude" / "review").mkdir(parents=True)
+    (projn / ".claude" / "review" / "usage.jsonl").write_text(
+        '{"tokens":100,"seconds":1,"model":"m","effort":"e"}\nnull\n[1]\n42\n',
+        encoding="utf-8")
+    check("非物件的合法 JSON 行會被略過", len(usage.read_rows(projn)) == 1,
+          usage.read_rows(projn))
+    check("--usage 不會被那種行弄崩", "共 1 次審查" in usage.summary(projn),
+          usage.summary(projn).splitlines()[:3])
 
     # 一般錯誤要連續三次才跳閘。
     proj2 = base / "breakerproj2"
