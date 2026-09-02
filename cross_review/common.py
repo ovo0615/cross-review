@@ -531,7 +531,10 @@ def run_codex(project: Path, prompt: str, schema_file: Path, out_file: Path,
     if out_file.exists():
         out_file.unlink()
 
-    cmd = [codex, "exec"]
+    # 這一趟 Codex 的角色是「Claude 工作成果的審查者」，不是一般的建置者。
+    # 關閉它自己的 lifecycle hooks，避免專案同時安裝 Codex → Claude Stop hook 時，
+    # 審查者 Codex 結束後又反向叫 Claude，形成雙向審查循環。
+    cmd = [codex, "--disable", "hooks", "exec"]
     # --image 吃多個值（<FILE>...），所以它後面一定要接另一個旗標，
     # 否則 prompt 的位置引數會被它吸進去。這裡乾脆把 prompt 走 stdin，
     # 完全不用位置引數——順便避開 Windows 命令列 8191 字元的上限。
