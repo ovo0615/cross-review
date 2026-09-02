@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import common, shots as shots_mod, transcript as tx
+from . import breaker, common, shots as shots_mod, transcript as tx, usage
 
 SCHEMA_DIR = Path(__file__).parent / "schemas"
 
@@ -400,8 +400,17 @@ def build_code_dossier(project: Path, job: dict, cfg: dict) -> tuple:
         add("```")
         budget -= len(diff.encode("utf-8"))
         add()
-        add("（以上為 git diff。以下為改動檔案的目前完整內容，供對照。）")
+        add("（以上為 git diff，前後各 20 行脈絡。）")
         add()
+
+    # 被 diff 涵蓋的大檔案不再送全文——diff 已經帶了前後各 20 行，
+    # 足以看懂一個函式。實測一個 57.8 KB 的測試檔佔掉整份材料包的 58%，
+    # 而同樣的改動用 diff 表示只要 9.4 KB。
+    # 新增的檔案不在 diff 裡（untracked），非 git 專案更是完全沒有 diff，
+    # 那兩種情況一律照送全文，否則審查者會什麼都看不到。
+    covered = tx.diff_covers(diff, project)
+    full_limit = common.positive_int(cfg, "full_content_max_bytes", 500)
+    diff_only = []
 
     partial_files = []
     full_files = []
@@ -410,6 +419,13 @@ def build_code_dossier(project: Path, job: dict, cfg: dict) -> tuple:
             truncated_files.append(path)
             continue
         rel = str(Path(path).relative_to(project))
+        try:
+            file_bytes = Path(path).stat().st_size
+        except OSError:
+            file_bytes = 0
+        if str(Path(path).resolve()) in covered and file_bytes > full_limit:
+            diff_only.append(path)
+            continue
         try:
             body = common.read_text(path)
         except Exception as exc:
@@ -437,6 +453,22 @@ def build_code_dossier(project: Path, job: dict, cfg: dict) -> tuple:
         add("```")
         add(body)
         add("```")
+        add()
+
+    if diff_only:
+        add("## 只給 diff、沒有給全文的檔案")
+        add()
+        add("這些檔案比較大，上面的 diff 已經帶了改動前後各 20 行。"
+            "**你看到的是改動本身，不是整個檔案。**若某個判斷需要看到檔案的"
+            "其他部分才能下，請在 verdict 裡講明白，不要用猜的。")
+        add()
+        for path in diff_only:
+            try:
+                size = Path(path).stat().st_size
+            except OSError:
+                size = 0
+            add("- " + str(Path(path).relative_to(project))
+                + "（%.1f KB，未收錄全文）" % (size / 1024))
         add()
 
     if truncated_files:
@@ -476,6 +508,7 @@ def build_code_dossier(project: Path, job: dict, cfg: dict) -> tuple:
         "files": files,
         "deleted": deleted,
         "rejected": rejected,
+        "diff_only": diff_only,
         # 報告要用這個數字。算出來卻沒帶出去的話，render_code_report 會退回
         # len(meta["files"])，遇到刪除或節錄就低估實際改動數。
         "total_changed": total_changed,
@@ -673,9 +706,16 @@ def run_code(project: Path, job: dict, cfg: dict) -> int:
     )
     if err:
         common.log_error(project, "程式碼審查失敗：" + err)
+        note = breaker.record_failure(project, err)
         print("⚠️ 本回合的程式碼審查沒有跑成。原因：" + err)
+        if note:
+            print("⛔ " + note)
         print("（已記到 .claude/review/errors.log。這不是『審過了沒問題』。）")
         return 1
+
+    breaker.record_success(project)
+    usage.record(project, "code", round_no, data,
+                 len(dossier_text.encode("utf-8")))
 
     report = render_code_report(data, meta)
     common.write_text(rdir / ("report-" + str(round_no) + "-code.md"), report)
@@ -736,9 +776,16 @@ def run_visual(project: Path, job: dict, cfg: dict) -> int:
     )
     if err:
         common.log_error(project, "視覺審查失敗：" + err)
+        note = breaker.record_failure(project, err)
         print("⚠️ 本回合的視覺審查沒有跑成。原因：" + err)
+        if note:
+            print("⛔ " + note)
         print("（已記到 .claude/review/errors.log。這不是『畫面沒問題』。）")
         return 1
+
+    breaker.record_success(project)
+    usage.record(project, "visual", round_no, data,
+                 len(dossier_text.encode("utf-8")))
 
     meta = {
         "round": round_no,

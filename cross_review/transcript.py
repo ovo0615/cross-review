@@ -200,7 +200,30 @@ def git_head(project: Path) -> str:
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
-def git_diff(project: Path, max_bytes: int, paths=None, base: str = "HEAD") -> str:
+def diff_covers(diff_text: str, project: Path) -> set:
+    """這份 diff 實際涵蓋了哪些檔案（絕對路徑）。
+
+    只有被 diff 涵蓋的檔案才可以省略全文——新增的檔案不會出現在
+    `git diff` 裡（untracked），非 git 專案更是完全沒有 diff。
+    那兩種情況若也省略全文，審查者會什麼都看不到。
+    """
+    covered = set()
+    for line in diff_text.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        # diff --git a/<path> b/<path>
+        parts = line.split(" b/", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            covered.add(str((project / parts[1].strip()).resolve()))
+        except Exception:
+            pass
+    return covered
+
+
+def git_diff(project: Path, max_bytes: int, paths=None, base: str = "HEAD",
+             context: int = 20) -> str:
     """相對於 `base` 的改動，**只限於指定的那幾個檔案**。
 
     base 預設是 HEAD，但呼叫端應該傳「回合開始時的那個 commit」。
@@ -227,7 +250,8 @@ def git_diff(project: Path, max_bytes: int, paths=None, base: str = "HEAD") -> s
     def run(ref: str):
         try:
             return subprocess.run(
-                ["git", "-C", str(project), "diff", ref, "--"] + rel,
+                ["git", "-C", str(project), "diff", "-U" + str(int(context)),
+                 ref, "--"] + rel,
                 capture_output=True, timeout=30)
         except Exception:
             return None

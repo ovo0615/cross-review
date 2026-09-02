@@ -266,6 +266,10 @@ DEFAULT_CONFIG = {
         "chrome@openai-bundled",
     ],
     "codex_timeout_sec": 900,
+    # 超過這個大小、而且已經被 diff 涵蓋的檔案，只送 diff 不送全文。
+    # diff 帶前後各 20 行，足以看懂一個函式；而一個 57.8 KB 的測試檔
+    # 送全文會佔掉整份材料包的 58%。
+    "full_content_max_bytes": 8000,
     # 審查者用哪個模型、多用力。留空＝沿用 ~/.codex/config.toml 的全域設定。
     # 值得知道的是預設不是最強的：gpt-5.6-luna 是「fast and affordable」那一階，
     # 同一代裡 gpt-5.6-sol 才是 frontier。重要的專案可以在這裡調上去。

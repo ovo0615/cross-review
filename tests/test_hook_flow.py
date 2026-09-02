@@ -1206,6 +1206,83 @@ def scenario_cdp_events(base: Path) -> None:
         shot.unlink()
 
 
+def scenario_breaker_and_usage(base: Path) -> None:
+    """斷路器與用量帳本。錯誤訊息是 2026-09-02 額度真的用完時擷取的原文。"""
+    sys.path.insert(0, str(TOOL_ROOT))
+    from cross_review import breaker, common, usage
+    import time as _time
+
+    REAL = ("codex 結束（exit 1，34 秒）但沒有輸出：ERROR: You've hit your usage "
+            "limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit "
+            "https://chatgpt.com/codex/settings/usage to purchase more credits "
+            "or try again at 1:27 PM. / tokens used / 35,477")
+
+    check("認得出額度用完的錯誤", breaker.is_quota_error(REAL))
+    check("一般錯誤不會被當成額度問題",
+          not breaker.is_quota_error("codex 逾時（900 秒）"))
+
+    # 時間解析：早上 09:00 看到「1:27 PM」應該是今天 13:27。
+    morning = _time.mktime((2026, 9, 2, 9, 0, 0, 0, 0, -1))
+    got = breaker.parse_reset_time(REAL, now=morning)
+    check("從訊息解析出恢復時間",
+          _time.strftime("%H:%M", _time.localtime(got)) == "13:27",
+          _time.strftime("%Y-%m-%d %H:%M", _time.localtime(got)))
+    check("恢復時間在未來", got > morning)
+    # 晚上 20:00 看到「1:27 PM」應該是明天，不是今天的過去式。
+    evening = _time.mktime((2026, 9, 2, 20, 0, 0, 0, 0, -1))
+    got2 = breaker.parse_reset_time(REAL, now=evening)
+    check("已經過去的時刻要算成明天", got2 > evening,
+          _time.strftime("%Y-%m-%d %H:%M", _time.localtime(got2)))
+    check("解析不到時間就回 0", breaker.parse_reset_time("完全不相干的錯誤") == 0.0)
+
+    proj = base / "breakerproj"
+    (proj / ".claude" / "review").mkdir(parents=True)
+
+    # 額度錯誤：一次就跳閘，不必等三次——再試也是白試。
+    note = breaker.record_failure(proj, REAL)
+    check("額度用完一次就跳閘", bool(note), repr(note))
+    check("跳閘後 hook 會拿到暫停訊息",
+          "審查暫停中" in breaker.paused_note(proj), breaker.paused_note(proj))
+    check("暫停訊息含恢復時間", "自動恢復" in breaker.paused_note(proj))
+
+    # 成功一次就解除。
+    breaker.record_success(proj)
+    check("成功之後解除暫停", breaker.paused_note(proj) == "",
+          breaker.paused_note(proj))
+
+    # 一般錯誤要連續三次才跳閘。
+    proj2 = base / "breakerproj2"
+    (proj2 / ".claude" / "review").mkdir(parents=True)
+    for i in (1, 2):
+        check("一般錯誤第 %d 次不跳閘" % i,
+              not breaker.record_failure(proj2, "codex 逾時（900 秒）"))
+    check("一般錯誤第 3 次跳閘",
+          bool(breaker.record_failure(proj2, "codex 逾時（900 秒）")))
+
+    # 用量帳本
+    usage.record(proj, "code", 1,
+                 {"_model": "gpt-5.6-sol", "_effort": "high",
+                  "_elapsed_sec": 144.4, "_tokens": 80075,
+                  "findings": [1, 2, 3], "blocking": False}, 99800)
+    usage.record(proj, "visual", 1,
+                 {"_model": "gpt-5.6-luna", "_effort": "high",
+                  "_elapsed_sec": 119.3, "_tokens": 65192,
+                  "findings": [1], "blocking": False}, 24000)
+    text = usage.summary(proj)
+    check("彙總含總 tokens", "145,267" in text, text[:300])
+    check("彙總依模型分列", "gpt-5.6-sol" in text and "gpt-5.6-luna" in text)
+    check("彙總含次數", "共 2 次審查" in text, text[:200])
+    check("沒有帳本時不會爆炸",
+          "還沒有任何用量紀錄" in usage.summary(base / "沒有這個專案"))
+
+    # 壞掉的一行不該讓整份帳本讀不出來
+    with open(proj / ".claude" / "review" / "usage.jsonl", "a",
+              encoding="utf-8") as fh:
+        fh.write("{這不是合法 JSON\n")
+    check("帳本裡有壞行仍讀得出其餘的", len(usage.read_rows(proj)) == 2,
+          str(len(usage.read_rows(proj))))
+
+
 def main() -> int:
     base = Path(tempfile.mkdtemp(prefix="crossreview_test_"))
     try:
@@ -1217,6 +1294,7 @@ def main() -> int:
         scenario_usage(base)
         scenario_hardening(base)
         scenario_cdp_events(base)
+        scenario_breaker_and_usage(base)
     finally:
         shutil.rmtree(base, ignore_errors=True)
 

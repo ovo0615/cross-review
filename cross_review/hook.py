@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import common, transcript as tx
+from . import breaker, common, transcript as tx
 
 TOOL_ROOT = Path(__file__).resolve().parent.parent
 RUNNER = TOOL_ROOT / "run_review.py"
@@ -107,6 +107,12 @@ def main() -> int:
     cfg = common.ensure_config(project)
     if not cfg.get("enabled", True):
         return 0
+
+    # 斷路器跳閘中就不要再送審——每次重試都是再燒一次額度然後再失敗一次。
+    # 但一定要講出來：「審查停著」跟「審查通過」在畫面上長得一模一樣。
+    paused = breaker.paused_note(project)
+    if paused:
+        passthrough(paused)
 
     modes = []
     if cfg.get("visual_review", True) and cfg.get("shots"):
@@ -224,6 +230,7 @@ def main() -> int:
     # ---- 建工作單並攔阻 ----
     round_no = int(state.get("round", 0)) + 1
     now = time.time()
+    head_now = tx.git_head(project)
     job_path = rdir / ("job-" + str(round_no) + ".json")
     fingerprints = {}
     for path in files:
@@ -239,10 +246,11 @@ def main() -> int:
         "start_line": state.get("cursor", 0),
         "end_line": end_line,
         "since": watermark,
-        # 回合開始時的 commit。審查時 diff 要對照這個，不能用 HEAD——
-        # 執行者只要在收尾前 commit 過，diff 就會是空的，
-        # 材料包於是退而送整份檔案（最貴的一條路）。
-        "base_sha": tx.git_head(project),
+        # 這一輪的起點是「**上一次** Stop 當下的 HEAD」，不是現在的 HEAD。
+        # hook 在回合結束時才跑，那時執行者可能已經把這一輪 commit 掉了，
+        # 拿當下的 HEAD 當基準，diff 只會剩下 commit 之後的零星改動——
+        # 等於沒修好。（第一版就是這樣，實測 diff 只涵蓋 5 個檔案裡的 2 個。）
+        "base_sha": state.get("head_sha") or head_now,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "files": files,
         "deleted": fresh_deletions,
@@ -253,6 +261,8 @@ def main() -> int:
         "fingerprints": fingerprints,
     })
 
+    # 這一次的 HEAD 就是下一輪的起點。
+    state["head_sha"] = head_now
     state["round"] = round_no
     state["pending"] = {
         "round": round_no,
