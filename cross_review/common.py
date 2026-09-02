@@ -331,14 +331,16 @@ SECURITY_KEYS = {"allow_remote_urls", "allow_file_urls", "disable_codex_plugins"
 def user_settings_path() -> Path:
     """使用者層級的設定檔。安全邊界與觸發授權都住在這裡。
 
-    CROSS_REVIEW_SETTINGS 可以改指到別的檔案。這是給測試用的——否則要驗
-    「專案不能自己解除 manual」就得去動使用者真實的檔案。它不構成弱點：
-    能設環境變數的人已經有這台機器上的執行權限了，而威脅模型針對的是
-    「clone 回來的版本庫自帶一份 config.json」，那種檔案設不了環境變數。
+    這個位置**沒有覆寫機制**。上一版加過一個 CROSS_REVIEW_SETTINGS 環境變數
+    給測試用，理由是「clone 回來的版本庫設不了環境變數」——那是錯的：
+    Claude Code 的專案 `.claude/settings.json` 可以帶 `env` 區塊，而官方文件
+    明講那個檔案就是要 commit 進版本庫給所有人用的。使用者信任資料夾之後
+    那些變數就生效了。
+
+    「信任資料夾以執行 hook」跟「同意把這裡的程式碼送給第三方模型」是兩件事，
+    而這條邊界存在的目的正是把它們分開。所以那扇門必須關掉：測試改成把
+    整個家目錄指到暫存目錄，那不是這個工具自己開的通道。
     """
-    override = os.environ.get("CROSS_REVIEW_SETTINGS")
-    if override:
-        return Path(override)
     return Path.home() / ".claude" / "cross-review.json"
 
 
@@ -404,8 +406,20 @@ def granted_trigger(project: Path) -> str:
 
 
 def grant_trigger(project: Path, mode: str) -> None:
-    """把授權寫進使用者層級的檔案。這是 --trigger 唯一該寫的地方。"""
-    data = read_json(user_settings_path())
+    """把授權寫進使用者層級的檔案。這是 --trigger 唯一該寫的地方。
+
+    這個檔案還放著 allow_remote_urls 等安全鍵。原本解析失敗就以空物件覆寫，
+    等於一個手誤的逗號就把整份安全設定與所有專案的授權清掉。寧可什麼都不寫。
+    """
+    path = user_settings_path()
+    data = read_json(path)
+    if data is None and path.exists():
+        raise RuntimeError(
+            str(path) + " 不是合法的 JSON，拒絕覆寫（裡面還有安全設定）。"
+            "請先修好那個檔案。")
+    if data is not None and not isinstance(data, dict):
+        raise RuntimeError(
+            str(path) + " 的內容不是物件，拒絕覆寫（裡面還有安全設定）。")
     if not isinstance(data, dict):
         data = {}
     table = data.get("triggers")

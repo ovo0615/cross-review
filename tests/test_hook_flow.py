@@ -56,9 +56,13 @@ def touch(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-# 測試專用的使用者層級設定檔。指到這裡，測試才能驗「專案自己設不了 auto」
-# 而不必去動使用者真實的 %USERPROFILE%\.claude\cross-review.json。
-USER_SETTINGS = None
+# 整批測試把家目錄指到暫存目錄，所以 common.user_settings_path() 解析出來的
+# 是暫存的那一份，不會碰使用者真實的檔案。
+#
+# 為什麼不用工具自己的環境變數：那等於在安全邊界上開一扇門，而 Claude Code
+# 的專案 .claude/settings.json 可以帶 env 區塊並 commit 進版本庫——clone 回來
+# 的 repo 就能把那個變數指到自己的檔案。改家目錄不是這個工具開的通道。
+FAKE_HOME = None
 
 
 def force_auto(project: Path) -> None:
@@ -77,19 +81,38 @@ def force_auto(project: Path) -> None:
 
 
 def grant(project: Path, mode: str) -> None:
-    """在測試用的使用者層級檔案裡授予這個專案某個觸發模式。"""
-    data = {}
-    if USER_SETTINGS and USER_SETTINGS.exists():
-        try:
-            data = json.loads(USER_SETTINGS.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    if not isinstance(data, dict):
-        data = {}
-    table = data.setdefault("triggers", {})
-    table[str(Path(project).resolve())] = mode
-    USER_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-    USER_SETTINGS.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    """授予這個專案某個觸發模式。
+
+    走**正式的寫入端** common.grant_trigger()，不要自己寫 JSON——測試自己
+    實作一份的話，只證明得了讀取端接受測試資料，攔不住寫入端的覆寫問題。
+
+    只在這一次呼叫期間把家目錄指到暫存目錄。不整個行程改掉：測試裡會啟動
+    真正的 Chrome，那個行程需要真實的家目錄。
+    """
+    sys.path.insert(0, str(TOOL_ROOT))
+    from cross_review import common
+    with fake_home():
+        common.grant_trigger(project, mode)
+
+
+class fake_home:
+    """暫時把家目錄指到 FAKE_HOME，離開時還原。"""
+
+    KEYS = ("USERPROFILE", "HOME")
+
+    def __enter__(self):
+        self.saved = {k: os.environ.get(k) for k in self.KEYS}
+        for k in self.KEYS:
+            os.environ[k] = str(FAKE_HOME)
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return False
 
 
 def run_hook(project: Path, transcript: Path):
@@ -100,8 +123,9 @@ def run_hook(project: Path, transcript: Path):
         "stop_hook_active": False,
     })
     env = dict(os.environ)
-    if USER_SETTINGS:
-        env["CROSS_REVIEW_SETTINGS"] = str(USER_SETTINGS)
+    if FAKE_HOME:
+        env["USERPROFILE"] = str(FAKE_HOME)
+        env["HOME"] = str(FAKE_HOME)
     proc = subprocess.run(
         [sys.executable, str(RUN_HOOK)],
         input=payload.encode("utf-8"),
@@ -1318,6 +1342,30 @@ def scenario_trigger_modes(base: Path) -> None:
           "門檻" in (out or {}).get("reason", ""), (out or {}).get("reason", "")[:120])
     check("門檻觸發也會建工作單", bool(list(rdir.glob("job-*.json"))))
 
+    # 使用者層級檔案還放著 allow_remote_urls 這類安全鍵。原本寫入端在解析
+    # 失敗時會以空物件覆寫，一個手誤的逗號就把整份安全設定與所有授權清掉。
+    from cross_review import common as _cm
+    with fake_home():
+        settings = _cm.user_settings_path()
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text('{"allow_remote_urls": true, "triggers": {}}',
+                            encoding="utf-8")
+        _cm.grant_trigger(proj, "threshold")
+        kept = json.loads(settings.read_text(encoding="utf-8"))
+        check("授權不會蓋掉檔案裡既有的其他設定",
+              kept.get("allow_remote_urls") is True, kept)
+
+        settings.write_text('{"allow_remote_urls": true,,}', encoding="utf-8")
+        broke = ""
+        try:
+            _cm.grant_trigger(proj, "threshold")
+        except RuntimeError as exc:
+            broke = str(exc)
+        check("檔案壞掉時拒絕覆寫，而不是清空", bool(broke), broke[:80])
+        check("壞掉的內容原封不動",
+              "allow_remote_urls" in settings.read_text(encoding="utf-8"))
+        settings.write_text('{"triggers": {}}', encoding="utf-8")
+
 
 def scenario_receipt(base: Path) -> None:
     """手動觸發的審查跑完後，收據要由 hook 兌現。
@@ -1937,12 +1985,18 @@ def scenario_breaker_and_usage(base: Path) -> None:
 
 
 def main() -> int:
-    global USER_SETTINGS
+    global FAKE_HOME
     base = Path(tempfile.mkdtemp(prefix="crossreview_test_"))
-    # 整批測試共用一份使用者層級設定，指到暫存目錄裡——絕對不要碰
-    # 使用者真實的 %USERPROFILE%\.claude\cross-review.json。
-    USER_SETTINGS = base / "user-cross-review.json"
-    os.environ["CROSS_REVIEW_SETTINGS"] = str(USER_SETTINGS)
+    # 把家目錄指到暫存目錄：測試行程與它開出來的子行程都會用這一份，
+    # 絕對不要碰使用者真實的檔案。
+    # 家目錄設成測試根目錄**本身**，不是它底下的子目錄：find_project_root()
+    # 用「家目錄（不含）」當往上走的界線，測試專案必須落在它底下，否則走訪
+    # 會一路爬到真實家目錄（那裡永遠有 .claude），把整個家目錄當成專案掃。
+    #
+    # 不在這裡改 os.environ：測試裡會啟動真正的 Chrome，改掉整個行程的家目錄
+    # 它就起不來。只有 run_hook()（子行程）與 grant()（寫入時）會切換。
+    FAKE_HOME = base
+    (FAKE_HOME / ".claude").mkdir(parents=True, exist_ok=True)
     try:
         scenario_non_git(base)
         scenario_git(base)
