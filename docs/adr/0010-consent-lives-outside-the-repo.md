@@ -44,7 +44,23 @@ ADR-0008 選了 `threshold` 當預設，理由是「純手動會忘記，門檻�
 - 既有專案的 `config.json` 裡若寫著 `threshold`／`auto`，升級後會降級成
   `manual`，直到使用者用 `--trigger` 明確授權。這是刻意的：那些值是在舊的
   信任模型下寫的。
-- 測試需要在不碰使用者真實檔案的前提下驗這條邊界，所以
-  `user_settings_path()` 認 `CROSS_REVIEW_SETTINGS` 環境變數。這不構成弱點：
-  能設環境變數的人已經有這台機器的執行權限，而威脅模型針對的是
-  「clone 回來的版本庫自帶一份 config.json」——那種檔案設不了環境變數。
+## 這條邊界擋得住什麼、擋不住什麼
+
+**擋得住：版本庫裡 commit 進來的 `.claude/review/config.json`。**
+這是現實中會發生的情況——別人的專案本來就用 cross-review 且設成 `threshold`，
+你 clone 回來之後那份設定不該自動對你生效。
+
+**擋不住：版本庫裡 commit 進來的 `.claude/settings.json`。**
+官方文件寫明那個檔案就是設計來 commit 給團隊用的，內容包含
+「Team permissions, **hooks**, plugins, and the environment variables the project needs」。
+能寫那個檔案的版本庫可以直接定義自己的 Stop hook 執行任意指令——
+到那一步，它根本不需要繞過 cross-review 的同意檔，自己呼叫 codex 就好。
+
+所以在那個威脅模型下，**任何工具內部的邊界都是無效的**，控制點是 Claude Code
+自己的「信任這個資料夾」提示。把 `Path.home()` 換成不受環境變數影響的
+作業系統 API 只會關掉比較弱的那條路、留著比較強的那條，屬於安全劇場。
+
+第一版曾經加過一個 `CROSS_REVIEW_SETTINGS` 環境變數給測試用，並在這裡寫著
+「clone 回來的版本庫設不了環境變數」。那句話是錯的（見上），該覆寫已移除——
+**不是因為它會被利用，而是因為那是這個工具自己開的、沒有必要的門。**
+測試改成把家目錄指到暫存目錄，用的是作業系統本來就有的機制。

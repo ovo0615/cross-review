@@ -1342,29 +1342,49 @@ def scenario_trigger_modes(base: Path) -> None:
           "門檻" in (out or {}).get("reason", ""), (out or {}).get("reason", "")[:120])
     check("門檻觸發也會建工作單", bool(list(rdir.glob("job-*.json"))))
 
-    # 使用者層級檔案還放著 allow_remote_urls 這類安全鍵。原本寫入端在解析
-    # 失敗時會以空物件覆寫，一個手誤的逗號就把整份安全設定與所有授權清掉。
+
+
+
+def scenario_user_consent(base: Path) -> None:
+    """使用者層級的授權檔案。
+
+    這個檔案除了授權還放著 allow_remote_urls 等安全鍵，所以寫入端的失敗模式
+    不是「這一次沒寫成」，而是「把整份安全設定清掉」。
+    """
     from cross_review import common as _cm
+    proj = base / "consentproj"
+    (proj / ".claude" / "review").mkdir(parents=True)
+
     with fake_home():
         settings = _cm.user_settings_path()
         settings.parent.mkdir(parents=True, exist_ok=True)
+
         settings.write_text('{"allow_remote_urls": true, "triggers": {}}',
                             encoding="utf-8")
         _cm.grant_trigger(proj, "threshold")
         kept = json.loads(settings.read_text(encoding="utf-8"))
         check("授權不會蓋掉檔案裡既有的其他設定",
               kept.get("allow_remote_urls") is True, kept)
+        check("授權真的寫進去了",
+              kept.get("triggers", {}).get(str(proj.resolve())) == "threshold", kept)
 
-        settings.write_text('{"allow_remote_urls": true,,}', encoding="utf-8")
-        broke = ""
-        try:
-            _cm.grant_trigger(proj, "threshold")
-        except RuntimeError as exc:
-            broke = str(exc)
-        check("檔案壞掉時拒絕覆寫，而不是清空", bool(broke), broke[:80])
-        check("壞掉的內容原封不動",
-              "allow_remote_urls" in settings.read_text(encoding="utf-8"))
-        settings.write_text('{"triggers": {}}', encoding="utf-8")
+        # 壞掉的檔案：要比對呼叫前後的**完整內容**。只確認某個字串還在的話，
+        # 內容被部分改寫也照樣過關——那種綠燈什麼都沒證明。
+        for label, content in (
+                ("整份不是合法 JSON", '{"allow_remote_urls": true,,}'),
+                ("最外層不是物件", '["allow_remote_urls"]'),
+                ("triggers 不是物件", '{"allow_remote_urls": true, "triggers": []}')):
+            settings.write_text(content, encoding="utf-8")
+            before = settings.read_text(encoding="utf-8")
+            refused = ""
+            try:
+                _cm.grant_trigger(proj, "threshold")
+            except RuntimeError as exc:
+                refused = str(exc)
+            check("拒絕覆寫：" + label, bool(refused), refused[:70])
+            check("內容一個字都沒動：" + label,
+                  settings.read_text(encoding="utf-8") == before,
+                  settings.read_text(encoding="utf-8")[:60])
 
 
 def scenario_receipt(base: Path) -> None:
@@ -2007,6 +2027,7 @@ def main() -> int:
         scenario_hardening(base)
         scenario_cdp_events(base)
         scenario_trigger_modes(base)
+        scenario_user_consent(base)
         scenario_receipt(base)
         scenario_other_agents_directories(base)
         scenario_referenced_context(base)

@@ -423,6 +423,11 @@ def grant_trigger(project: Path, mode: str) -> None:
     if not isinstance(data, dict):
         data = {}
     table = data.get("triggers")
+    if table is not None and not isinstance(table, dict):
+        # 外層是物件、triggers 卻是陣列或字串時，原本會靜默換成空物件，
+        # 把其他專案的授權一起清掉。跟外層同一個判準：寧可什麼都不寫。
+        raise RuntimeError(
+            str(path) + " 裡的 triggers 不是物件，拒絕覆寫（會清掉其他專案的授權）。")
     if not isinstance(table, dict):
         table = {}
     table[str(Path(project).resolve())] = str(mode).lower()
