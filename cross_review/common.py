@@ -299,11 +299,19 @@ DEFAULT_CONFIG = {
     # diff 帶前後各 20 行，足以看懂一個函式；而一個 57.8 KB 的測試檔
     # 送全文會佔掉整份材料包的 58%。
     "full_content_max_bytes": 8000,
-    # 審查者用哪個模型、多用力。留空＝沿用 ~/.codex/config.toml 的全域設定。
-    # 值得知道的是預設不是最強的：gpt-5.6-luna 是「fast and affordable」那一階，
-    # 同一代裡 gpt-5.6-sol 才是 frontier。重要的專案可以在這裡調上去。
-    "codex_model": "",
-    "codex_reasoning_effort": "",
+    # 審查者用哪個模型、多用力。
+    #
+    # 明確指定而不是留空沿用 ~/.codex/config.toml：那份全域設定是使用者平常
+    # 自己用 Codex 的設定，會因為別的需求被改動；審查該用什麼跟那個無關。
+    # 留空的話，審查品質會在使用者某天調整自己的 Codex 設定時無聲地跟著變。
+    #
+    # gpt-5.6-sol 是這一代的 frontier（luna 是「fast and affordable」那一階）。
+    # 用量帳本上的實測：luna/high 平均 109,887 tokens、sol/medium 65,391、
+    # sol/high 89,836——sol 不但更強，而且比 luna 便宜。
+    #
+    # 模型會換代。這兩個值是使用者在 2026-09-02 挑的，之後隨新模型出現再調整。
+    "codex_model": "gpt-5.6-sol",
+    "codex_reasoning_effort": "high",
 }
 
 
