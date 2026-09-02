@@ -19,8 +19,14 @@ if __name__ == "__main__":
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
-        target = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.cwd()
-        sys.exit(run_now(target))
+        rest = [a for a in sys.argv[2:]]
+        only = None
+        if "--mode" in rest:
+            i = rest.index("--mode")
+            only = rest[i + 1] if len(rest) > i + 1 else None
+            del rest[i:i + 2]
+        target = Path(rest[0]) if rest else Path.cwd()
+        sys.exit(run_now(target, only))
 
     # `--trigger auto|manual|threshold [專案路徑]` 改這個專案的觸發模式。
     if len(sys.argv) > 2 and sys.argv[1] == "--trigger":

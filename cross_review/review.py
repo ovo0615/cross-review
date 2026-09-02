@@ -896,8 +896,10 @@ if __name__ == "__main__":
     sys.exit(main())
 
 
-def run_now(project: Path) -> int:
+def run_now(project: Path, only: str = None) -> int:
     """使用者手動觸發：把累積至今的改動組成一份工作單，當場審完。
+
+    `only` 可以限定只跑 "code" 或 "visual"。
 
     不依賴 hook 產生的工作單——手動／門檻模式下 hook 根本不會建。
     跑完只寫收據（reviewed.json），不碰 state.json：hook 也在寫那個檔案，
@@ -925,9 +927,26 @@ def run_now(project: Path) -> int:
     reported = {p for p in (state.get("reported_deletions") or [])
                 if not Path(p).exists()}
     deletions = [p for p in deleted if p not in reported]
+    modes = []
+    if cfg.get("visual_review", True) and cfg.get("shots"):
+        modes.append("visual")          # 快的排前面（ADR-0003）
+    if cfg.get("code_review", True):
+        modes.append("code")
+    if only:
+        modes = [m for m in modes if m == only]
+        if not modes:
+            print("這個專案沒有啟用「" + str(only) + "」審查，或沒有設定要看的畫面。")
+            return 1
+
     if not files and not deletions:
-        print("沒有累積的改動，這一次不用審查。")
-        return 0
+        # 視覺審查**不需要**程式碼改動：使用者想看的是畫面，跟這一輪有沒有
+        # 改到檔案無關。原本這裡直接回傳，於是「我只想看一眼畫面」做不到——
+        # 而那正是這個工具最初要解決的事（不必再自己截圖給人看）。
+        modes = [m for m in modes if m == "visual"]
+        if not modes:
+            print("沒有累積的改動，也沒有設定要看的畫面，這一次不用審查。")
+            return 0
+        print("沒有程式碼改動，只跑視覺審查。")
 
     round_no = dispatch.next_round(project, state)
     head_now = tx.git_head(project)
@@ -936,12 +955,6 @@ def run_now(project: Path) -> int:
         end_line, watermark, files, deletions,
         base_sha=state.get("head_sha") or head_now, dispatched=scan_started)
     job = common.read_json(job_path) or {}
-
-    modes = []
-    if cfg.get("visual_review", True) and cfg.get("shots"):
-        modes.append("visual")
-    if cfg.get("code_review", True):
-        modes.append("code")
 
     worst = 0
     for mode in modes:
