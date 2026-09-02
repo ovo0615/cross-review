@@ -1370,10 +1370,15 @@ def scenario_user_consent(base: Path) -> None:
 
         # 壞掉的檔案：要比對呼叫前後的**完整內容**。只確認某個字串還在的話，
         # 內容被部分改寫也照樣過關——那種綠燈什麼都沒證明。
+        # 型別判斷涵蓋「不是 dict」，所以陣列與字串都要測——只測陣列的話，
+        # 字串那條路等於沒有人走過。
         for label, content in (
                 ("整份不是合法 JSON", '{"allow_remote_urls": true,,}'),
                 ("最外層不是物件", '["allow_remote_urls"]'),
-                ("triggers 不是物件", '{"allow_remote_urls": true, "triggers": []}')):
+                ("最外層是字串", '"nope"'),
+                ("triggers 是陣列", '{"allow_remote_urls": true, "triggers": []}'),
+                ("triggers 是字串", '{"allow_remote_urls": true, "triggers": "x"}'),
+                ("triggers 是 null 以外的純量", '{"triggers": 42}')):
             settings.write_text(content, encoding="utf-8")
             before = settings.read_text(encoding="utf-8")
             refused = ""
@@ -1385,6 +1390,14 @@ def scenario_user_consent(base: Path) -> None:
             check("內容一個字都沒動：" + label,
                   settings.read_text(encoding="utf-8") == before,
                   settings.read_text(encoding="utf-8")[:60])
+
+        # 收尾一定要把共用的假家目錄還原成合法狀態。留著壞掉的內容，
+        # 後面的情境就得依賴「自己排在這個情境之前」才會過——那種綠燈
+        # 是靠執行順序撐著的，不是靠程式正確。
+        settings.write_text('{"triggers": {}}', encoding="utf-8")
+        _cm.grant_trigger(proj, "manual")
+        check("收尾後設定檔回到可用狀態",
+              isinstance(json.loads(settings.read_text(encoding="utf-8")), dict))
 
 
 def scenario_receipt(base: Path) -> None:
