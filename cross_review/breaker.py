@@ -110,9 +110,25 @@ def _load_mode(project: Path, mode: str) -> dict:
     # 才讀舊檔的話，那個仍然有效的暫停會被靜默丟掉，然後提前再送一次審。
     if legacy["account_until"] > out["account_until"]:
         out["account_until"] = legacy["account_until"]
-        if not out["reason"]:
+        # 原因要跟著勝出的那個暫停走。模式檔裡若留著更早的一般錯誤
+        # （「連線逾時」），訊息會變成「因為連線逾時所以等到 13:27」——
+        # 期限來自額度限制，原因卻是無關的舊錯誤，使用者判斷不了該等還是該查。
+        if legacy["reason"]:
             out["reason"] = legacy["reason"]
     return out
+
+
+def _reset_count(loaded: dict, current: dict) -> int:
+    """成功歸零時保留「讀完之後才新增」的失敗次數。"""
+    cur = current.get("failures")
+    cur = cur if isinstance(cur, int) and cur >= 0 else 0
+    return max(0, cur - int(loaded.get("failures") or 0))
+
+
+def _reset_pause(loaded: dict, current: dict) -> float:
+    """成功歸零時保留「讀完之後才出現」的暫停。"""
+    cur = _float(current.get("paused_until"))
+    return cur if cur > _float(loaded.get("paused_until")) else 0.0
 
 
 def _write_mode(project: Path, mode: str, data: dict, reset: bool = False) -> None:
@@ -127,17 +143,19 @@ def _write_mode(project: Path, mode: str, data: dict, reset: bool = False) -> No
     真正的原子性需要檔案鎖，代價與這個風險不成比例。
 
     `reset=True` 是成功時用的，會把自己的計數與暫停歸零——這是有意的覆寫，
-    但帳號層級的暫停仍然取最大值，因為那只有時間能解除。
+    但只針對「呼叫端讀到的那些」。磁碟上比呼叫端讀到的更新的部分要留著：
+    那代表在這次成功讀完狀態之後、寫回之前，另一個同模式的行程又記了
+    失敗。舊的成功不該把新的失敗抹掉。帳號層級的暫停一律取最大值。
     """
     current = common.read_json(_mode_path(project, mode))
     if not isinstance(current, dict):
         current = {}
     merged = {
-        "failures": 0 if reset else max(
+        "failures": _reset_count(data, current) if reset else max(
             int(data.get("failures") or 0),
             int(current.get("failures") or 0) if isinstance(
                 current.get("failures"), int) else 0),
-        "paused_until": 0.0 if reset else max(
+        "paused_until": _reset_pause(data, current) if reset else max(
             _float(data.get("paused_until")), _float(current.get("paused_until"))),
         "account_until": max(
             _float(data.get("account_until")), _float(current.get("account_until"))),

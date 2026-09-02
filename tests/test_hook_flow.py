@@ -1413,7 +1413,10 @@ def scenario_referenced_context(base: Path) -> None:
                     "referenced_context": ["我建議三件事"]}, {})
     rendered = "\n".join(rendered_lines)
     check("材料包不會宣稱使用者同意了那段內容",
-          "已經同意" not in rendered and "以上面他的原文為準" in rendered,
+          "已經同意" not in rendered and "以上面使用者的原文為準" in rendered,
+          rendered[:200])
+    check("材料包不會斷言那段脈絡一定相關",
+          "不一定相關" in rendered and "不是需求" in rendered,
           rendered[:200])
 
     # 使用者實際說的是「動手」，不是「可以動手」。白名單漏了這個詞，
@@ -1634,6 +1637,35 @@ def scenario_breaker_and_usage(base: Path) -> None:
     check("成功歸零不會把帳號層級的暫停一起清掉",
           breaker.paused_note(proj11, "code") == kept,
           (kept, breaker.paused_note(proj11, "code")))
+
+    # 成功行程讀完狀態之後、寫回之前，另一個同模式的行程又記了失敗。
+    # 舊的成功不該把新的失敗抹掉——寫回時只清「自己讀到的那些」。
+    proj12 = base / "breakerproj12"
+    (proj12 / ".claude" / "review").mkdir(parents=True)
+    for _ in range(2):
+        breaker.record_failure(proj12, "boom", "code")
+    stale = breaker._load_mode(proj12, "code")      # 成功行程此刻讀到的狀態
+    breaker.record_failure(proj12, "boom", "code")  # 第 3 次 → 模式暫停成立
+    breaker._write_mode(proj12, "code", stale, reset=True)
+    check("成功不會抹掉它讀完之後才出現的模式暫停",
+          breaker.paused_note(proj12, "code") != "",
+          breaker.paused_note(proj12, "code"))
+
+    # 期限來自舊版的額度限制時，原因也要跟著它走。模式檔裡留著更早的一般
+    # 錯誤的話，訊息會變成「因為連線逾時所以等到 13:27」，使用者判斷不了
+    # 該等還是該查。
+    proj13 = base / "breakerproj13"
+    r13 = proj13 / ".claude" / "review"
+    r13.mkdir(parents=True)
+    common.write_json(r13 / "breaker.json",
+                      {"paused_until": time.time() + 3600,
+                       "pause_kind": "quota", "reason": "額度用完"})
+    common.write_json(r13 / "breaker.code.json",
+                      {"failures": 1, "paused_until": 0.0, "account_until": 0.0,
+                       "reason": "連線逾時"})
+    check("暫停原因要跟著勝出的那個暫停走",
+          "額度用完" in breaker.paused_note(proj13, "code"),
+          breaker.paused_note(proj13, "code"))
 
     # 短暫限流沒有恢復時間就不該當成額度耗盡而停一小時。
     proj4 = base / "breakerproj4"
