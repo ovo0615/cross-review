@@ -392,7 +392,8 @@ def build_code_dossier(project: Path, job: dict, cfg: dict) -> tuple:
     # 建置產物的 minified bundle 會把額度吃光，原始碼反而進不來。
     # 刪掉的檔案也要進 diff。只給還存在的檔案的話，git 專案刪除程式碼時
     # 材料包只有檔名沒有內容，審查者無從判斷刪得對不對。
-    diff = tx.git_diff(project, budget // 2, included + deleted)
+    diff = tx.git_diff(project, budget // 2, included + deleted,
+                       base=job.get("base_sha") or "HEAD")
     if diff.strip():
         add("```diff")
         add(diff)

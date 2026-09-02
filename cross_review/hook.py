@@ -239,6 +239,10 @@ def main() -> int:
         "start_line": state.get("cursor", 0),
         "end_line": end_line,
         "since": watermark,
+        # 回合開始時的 commit。審查時 diff 要對照這個，不能用 HEAD——
+        # 執行者只要在收尾前 commit 過，diff 就會是空的，
+        # 材料包於是退而送整份檔案（最貴的一條路）。
+        "base_sha": tx.git_head(project),
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "files": files,
         "deleted": fresh_deletions,

@@ -1044,9 +1044,10 @@ def scenario_cdp_events(base: Path) -> None:
         腳本用完就丟 socket.timeout（模擬沒有新訊息）。
         """
 
-        def __init__(self, responses=None, inject=None):
+        def __init__(self, responses=None, inject=None, errors=()):
             self.responses = responses or {}
             self.inject = list(inject or [])
+            self.errors = set(errors)      # 這些 method 回傳錯誤
             self.pending = []
             self.sent = []
             self.recv_calls = 0
@@ -1057,8 +1058,12 @@ def scenario_cdp_events(base: Path) -> None:
             for after, event in self.inject:
                 if after == msg["method"]:
                     self.pending.append(event)
-            self.pending.append(
-                {"id": msg["id"], "result": self.responses.get(msg["method"], {})})
+            if msg["method"] in self.errors:
+                self.pending.append(
+                    {"id": msg["id"], "error": {"message": "不支援"}})
+            else:
+                self.pending.append(
+                    {"id": msg["id"], "result": self.responses.get(msg["method"], {})})
 
         def recv(self):
             self.recv_calls += 1
@@ -1066,9 +1071,9 @@ def scenario_cdp_events(base: Path) -> None:
                 raise _socket.timeout("沒有更多訊息")
             return _json.dumps(self.pending.pop(0))
 
-    def make(responses=None, inject=None):
+    def make(responses=None, inject=None, errors=()):
         b = Browser.__new__(Browser)      # 不要真的啟動 Chrome
-        b.ws = FakeWS(responses, inject)
+        b.ws = FakeWS(responses, inject, errors)
         b.timeout = 1.0
         b._id = 0
         b._events = []
@@ -1124,14 +1129,30 @@ def scenario_cdp_events(base: Path) -> None:
           b.ws.recv_calls > 4,
           "只讀了 %d 次，代表用了關聯不上的事件" % b.ws.recv_calls)
 
-    # --- 完全拿不到 loaderId 時才降級 ---
+    # --- 降級的條件是「lifecycle 沒 enable 成功」，不是「沒有 loaderId」---
+    # 這兩件事無關：setLifecycleEventsEnabled 失敗時，Page.navigate 通常
+    # 還是會回傳 loaderId。把降級綁在 loaderId 上，會讓不支援 lifecycle 的
+    # 環境下所有事件都被拒絕——每個畫面卡滿 30 秒逾時。
     for method, params in (("Page.loadEventFired", {}),
-                           ("Page.frameStoppedLoading", {"frameId": "F-ANY"})):
-        b = make({"Page.navigate": {}},
-                 [("Page.navigate", {"method": method, "params": params})])
+                           ("Page.frameStoppedLoading", {"frameId": "F-NEW"})):
+        b = make({"Page.navigate": NAV},          # 注意：仍然有 loaderId
+                 [("Page.navigate", {"method": method, "params": params})],
+                 errors=["Page.setLifecycleEventsEnabled"])
         b.goto("http://localhost:1/", settle_ms=0)
-        check("沒有 loaderId 時才降級採信 " + method,
-              b.ws.recv_calls == 4, str(b.ws.recv_calls))
+        check("lifecycle enable 失敗時會降級採信 " + method,
+              b.ws.recv_calls == 4,
+              "讀了 %d 次，代表沒有降級、在等永遠不會來的 lifecycleEvent"
+              % b.ws.recv_calls)
+
+    # --- 導航直接失敗時要立刻拋，不要白等 30 秒再對錯誤頁截圖 ---
+    b = make({"Page.navigate": {"errorText": "net::ERR_CONNECTION_REFUSED"}})
+    try:
+        b.goto("http://localhost:1/", settle_ms=0)
+        check("Page.navigate 回報 errorText 時要拋例外", False, "沒有拋")
+    except ConnectionError as exc:
+        check("Page.navigate 回報 errorText 時要拋例外",
+              "ERR_CONNECTION_REFUSED" in str(exc), str(exc))
+    check("導航失敗時不會繼續等事件", b.ws.recv_calls == 3, str(b.ws.recv_calls))
 
     # --- navigate 之前要清掉上一頁殘留的事件 ---
     b = make({"Page.navigate": NAV})

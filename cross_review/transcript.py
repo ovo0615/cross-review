@@ -186,8 +186,27 @@ def git_changed_files(project: Path) -> list:
     return files
 
 
-def git_diff(project: Path, max_bytes: int, paths=None) -> str:
-    """未提交的改動，**只限於指定的那幾個檔案**。
+def git_head(project: Path) -> str:
+    """回合開始時的 commit。拿不到就回空字串。"""
+    if not (project / ".git").exists():
+        return ""
+    try:
+        proc = subprocess.run(["git", "-C", str(project), "rev-parse", "HEAD"],
+                              capture_output=True, timeout=20)
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def git_diff(project: Path, max_bytes: int, paths=None, base: str = "HEAD") -> str:
+    """相對於 `base` 的改動，**只限於指定的那幾個檔案**。
+
+    base 預設是 HEAD，但呼叫端應該傳「回合開始時的那個 commit」。
+    用 HEAD 的話，只要執行者在收尾前 commit 過，diff 就是空的——
+    材料包於是退而送整份檔案，那是最貴的一條路：實測一個 57.8 KB 的
+    測試檔佔掉整份材料包的 58%，而同樣的改動用 diff 表示只要 9.4 KB。
 
     原本是 `git diff HEAD -- .`，把整個工作目錄都算進來。真實專案上立刻出事：
     `dist/` 底下一包 minified bundle 的差異就吃光了 200 KB 的材料包額度，
@@ -198,15 +217,26 @@ def git_diff(project: Path, max_bytes: int, paths=None) -> str:
         return ""
     if not paths:
         return ""
-    args = ["git", "-C", str(project), "diff", "HEAD", "--"]
+    rel = []
     for p in paths:
         try:
-            args.append(str(Path(p).relative_to(project)))
+            rel.append(str(Path(p).relative_to(project)))
         except Exception:
-            args.append(str(p))
-    try:
-        proc = subprocess.run(args, capture_output=True, timeout=30)
-    except Exception:
+            rel.append(str(p))
+
+    def run(ref: str):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(project), "diff", ref, "--"] + rel,
+                capture_output=True, timeout=30)
+        except Exception:
+            return None
+
+    proc = run(base or "HEAD")
+    if (proc is None or proc.returncode != 0) and (base or "HEAD") != "HEAD":
+        # base 失效（例如被 rebase 掉了）就退回 HEAD，不要整個沒有 diff。
+        proc = run("HEAD")
+    if proc is None or proc.returncode != 0:
         return ""
     text = proc.stdout.decode("utf-8", "replace")
     encoded = text.encode("utf-8")

@@ -348,7 +348,8 @@ class Browser:
 
     # -------------------------------------------------- 高階操作
     @staticmethod
-    def _is_this_navigation(event: dict, loader_id: str, frame_id: str) -> bool:
+    def _is_this_navigation(event: dict, loader_id: str, frame_id: str,
+                            lifecycle_on: bool = True) -> bool:
         """這個事件是不是「這一次」導航完成的證據。
 
         只清空佇列是不夠的：上一頁的停止事件若在清空之後、navigate 回應
@@ -363,9 +364,10 @@ class Browser:
         等於假設前後導航會有不同 frameId——那個假設本身就是錯的，
         測試因此把有 bug 的行為固定成了預期行為。）
 
-        拿得到 loaderId 時，只認 Page.lifecycleEvent；
-        拿不到時（lifecycle 沒 enable 成功、或舊版 Chrome）才退回那些
-        不可靠的訊號，並且知道自己是在降級。
+        降級的條件是「**lifecycle 有沒有 enable 成功**」，不是「有沒有 loaderId」。
+        這兩件事無關：setLifecycleEventsEnabled 失敗時，Page.navigate 通常
+        還是會回傳 loaderId。上一版把降級綁在 loaderId 上，結果在不支援
+        lifecycle 的環境下，所有事件都被拒絕——**每個畫面都卡滿 30 秒逾時**。
         """
         method = event.get("method")
         params = event.get("params") or {}
@@ -375,8 +377,8 @@ class Browser:
                 return False
             return not loader_id or params.get("loaderId") == loader_id
 
-        if loader_id:
-            return False        # 有可靠證據就不用關聯不上的訊號
+        if lifecycle_on:
+            return False        # 有可靠證據可等，就不用關聯不上的訊號
 
         # 以下是降級路徑：沒有 loaderId 可用時才會走到。
         if method == "Page.frameStoppedLoading":
@@ -393,22 +395,31 @@ class Browser:
         現在 socket 逾時被捕捉，行為與說明一致。
         """
         self.call("Page.enable")
-        # lifecycleEvent 是唯一帶 loaderId 的載入事件，沒有它就只能靠
-        # frameId 或猜。enable 失敗不致命，退回 frameStoppedLoading。
+        # lifecycleEvent 是唯一帶 loaderId 的載入事件。enable 失敗不致命，
+        # 但一定要記住失敗了——降級的條件是這個，不是「有沒有 loaderId」。
+        lifecycle_on = True
         try:
             self.call("Page.setLifecycleEventsEnabled", {"enabled": True})
         except Exception:
-            pass
+            lifecycle_on = False
 
         # 佇列在 navigate 之前清掉，擋掉「清空之前」的殘留；
-        # 「清空之後」才抵達的殘留由 loaderId／frameId 關聯擋掉。
+        # 「清空之後」才抵達的殘留由 loaderId 關聯擋掉。
         self._events.clear()
         result = self.call("Page.navigate", {"url": url})
+
+        # 導航直接失敗就不要等了。不檢查的話會白等滿 30 秒逾時，
+        # 然後對著 Chrome 的錯誤頁截圖並當成目標畫面送審。
+        error_text = str(result.get("errorText") or "")
+        if error_text:
+            raise ConnectionError("導覽 " + url + " 失敗：" + error_text)
+
         loader_id = str(result.get("loaderId") or "")
         frame_id = str(result.get("frameId") or "")
 
         # 先查佇列——這一次的載入事件可能在等 navigate 回應時就已經到了。
-        if any(self._is_this_navigation(e, loader_id, frame_id) for e in self._events):
+        if any(self._is_this_navigation(e, loader_id, frame_id, lifecycle_on)
+               for e in self._events):
             time.sleep(settle_ms / 1000.0)
             return
 
@@ -420,7 +431,7 @@ class Browser:
                 break                   # 等不到就走 settle，不要整個卡死
             except Exception:
                 break
-            if self._is_this_navigation(data, loader_id, frame_id):
+            if self._is_this_navigation(data, loader_id, frame_id, lifecycle_on):
                 break
             self._queue_event(data)
         time.sleep(settle_ms / 1000.0)
