@@ -101,7 +101,9 @@ def summary(project: Path) -> str:
     ]
     by_model = {}
     for r in rows:
-        key = (r.get("model") or "?") + " / " + (r.get("effort") or "?")
+        # str() 不能省：帳本裡的 model 若是數字，這裡的字串相接會 TypeError，
+        # 跟上面 _num() 想達成的「壞行不該弄崩整份彙總」是同一件事。
+        key = str(r.get("model") or "?") + " / " + str(r.get("effort") or "?")
         acc = by_model.setdefault(key, {"n": 0, "tok": 0, "sec": 0.0})
         acc["n"] += 1
         acc["tok"] += _num(r.get("tokens"), 0)

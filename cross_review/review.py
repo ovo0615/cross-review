@@ -937,10 +937,16 @@ def run_now(project: Path) -> int:
         else:
             worst = code
 
-    # 只要有一種審查真的產出了報告，這一批就算審過了，水位線可以往前。
-    # 全部失敗就不留收據——那批改動要留在累積裡，下次還看得到。
-    if any(job_path.with_suffix("." + m + ".done").exists() for m in modes):
+    # **每一種**審查都產出報告才算審過。原本是 any()：視覺成功、程式碼失敗
+    # （或被斷路器暫停）時照樣寫收據，水位線往前推，失敗的那批程式碼
+    # 再也不會被重審——而使用者看到的是「審過了」。
+    done = [m for m in modes if job_path.with_suffix("." + m + ".done").exists()]
+    if dispatch.all_modes_done(job_path, modes):
         dispatch.write_receipt(project, job, head_now)
+    elif done:
+        missing = [m for m in modes if m not in done]
+        print("⚠️ 只有 " + "、".join(done) + " 跑完，"
+              + "、".join(missing) + " 沒有結果，這批改動留在累積裡不會推進。")
     return worst
 
 

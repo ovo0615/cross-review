@@ -56,10 +56,26 @@ def load(project: Path) -> dict:
         fails = {"code": old, "visual": old}
     data["failures"] = {k: (int(v) if isinstance(v, int) else 0)
                         for k, v in fails.items()}
+    # 全域暫停：額度／限流。這是帳號層級的限制，擋掉所有模式。
     data.setdefault("paused_until", 0.0)
     data.setdefault("pause_kind", "")
-    data.setdefault("pause_mode", "")
     data.setdefault("reason", "")
+    # 各模式自己的暫停：連續失敗造成的。原本這三個欄位是共用的一組，
+    # code 跳閘之後 visual 也跳閘會蓋掉前一組——code 明明還在壞卻提前恢復。
+    # 失敗計數分了模式，暫停狀態卻沒分，等於只做了一半。
+    pauses = data.get("mode_pause")
+    if not isinstance(pauses, dict):
+        pauses = {}
+    if data.get("pause_kind") == "failures":
+        # 舊格式：那一組共用欄位搬進它原本屬於的模式，不要直接丟掉。
+        pauses[str(data.get("pause_mode") or "code")] = {
+            "until": float(data.get("paused_until") or 0),
+            "reason": str(data.get("reason") or ""),
+        }
+        data["paused_until"] = 0.0
+        data["pause_kind"] = ""
+    data["mode_pause"] = {k: v for k, v in pauses.items() if isinstance(v, dict)}
+    data.pop("pause_mode", None)
     return data
 
 
@@ -119,9 +135,7 @@ def record_failure(project: Path, message: str, mode: str = "code") -> str:
         note = "被限流，審查暫停到 " + _stamp(reset_at) + "（時間到自動恢復）"
     elif data["failures"][mode] >= MAX_FAILURES:
         until = time.time() + COOLDOWN_SEC
-        data["paused_until"] = until
-        data["pause_kind"] = "failures"
-        data["pause_mode"] = mode
+        data["mode_pause"][mode] = {"until": until, "reason": str(message)[:500]}
         note = ("「" + mode + "」連續 " + str(data["failures"][mode])
                 + " 次審查失敗，這個模式暫停 " + str(COOLDOWN_SEC // 60)
                 + " 分鐘（時間到自動恢復）")
@@ -144,12 +158,7 @@ def record_success(project: Path, mode: str = "code") -> None:
     if data["failures"].get(mode):
         data["failures"][mode] = 0
         changed = True
-    if (data.get("pause_kind") == "failures"
-            and data.get("pause_mode") == mode
-            and data.get("paused_until")):
-        data["paused_until"] = 0.0
-        data["pause_kind"] = ""
-        data["pause_mode"] = ""
+    if data["mode_pause"].pop(mode, None):
         changed = True
     if changed:
         common.write_json(_path(project), data)
@@ -165,14 +174,19 @@ def paused_note(project: Path, mode: str = None) -> str:
     「審查停著」跟「審查通過」在畫面上長得一模一樣。
     """
     data = load(project)
-    until = float(data.get("paused_until") or 0)
-    if until <= time.time():
-        return ""
-    kind = data.get("pause_kind") or ""
-    if kind == "failures" and mode and data.get("pause_mode") != mode:
-        return ""
-    scope = ("「" + str(data.get("pause_mode")) + "」審查"
-             if kind == "failures" else "審查")
+    now = time.time()
+    if float(data.get("paused_until") or 0) > now:
+        # 額度／限流是帳號層級的，擋掉每一個模式。
+        return _note("審查", float(data["paused_until"]), data.get("reason"))
+    for name in ([mode] if mode else sorted(data["mode_pause"])):
+        entry = data["mode_pause"].get(name) or {}
+        if float(entry.get("until") or 0) > now:
+            return _note("「" + str(name) + "」審查",
+                         float(entry["until"]), entry.get("reason"))
+    return ""
+
+
+def _note(scope: str, until: float, reason) -> str:
     return ("cross-review：" + scope + "暫停中，" + _stamp(until)
-            + " 自動恢復。原因：" + str(data.get("reason") or "未記錄")[:200]
+            + " 自動恢復。原因：" + str(reason or "未記錄")[:200]
             + "（要立刻恢復就刪掉 .claude/review/breaker.json）")

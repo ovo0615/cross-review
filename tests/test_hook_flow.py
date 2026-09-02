@@ -1309,6 +1309,48 @@ def scenario_receipt(base: Path) -> None:
     check("收據推進了 head_sha", st.get("head_sha") == "abc123", st.get("head_sha"))
     check("收據只兌現一次", st.get("receipt_round") == 7, st.get("receipt_round"))
 
+    # --- 第 30 回合審查抓到的：收據不能用「審完當下」當水位線 ---
+    p2 = base / "receiptclock"
+    (p2 / ".claude" / "review").mkdir(parents=True)
+    jp = dispatch.create_job(p2, 1, "", 0, 0, 0.0, [], [], base_sha="abc")
+    job = json.loads(jp.read_text(encoding="utf-8"))
+    check("工作單有記下派工時刻", bool(job.get("dispatched")), job.get("dispatched"))
+    time.sleep(0.6)                       # 假裝審查跑了一段時間
+    dispatch.write_receipt(p2, job, "abc")
+    receipt = json.loads(
+        (p2 / ".claude" / "review" / "reviewed.json").read_text(encoding="utf-8"))
+    check("收據沿用派工時刻，不是審完時刻",
+          abs(receipt["watermark"] - job["dispatched"]) < 0.001,
+          receipt["watermark"] - job["dispatched"])
+
+    # --- 部分模式沒跑完就不能寫收據 ---
+    p3 = base / "receiptpartial"
+    (p3 / ".claude" / "review").mkdir(parents=True)
+    jp3 = dispatch.create_job(p3, 1, "", 0, 0, 0.0, [], [], base_sha="abc")
+    (jp3.with_suffix(".visual.done")).write_text("", encoding="utf-8")
+    check("只有一種審查跑完就不算審過",
+          not dispatch.all_modes_done(jp3, ["visual", "code"]))
+    (jp3.with_suffix(".code.done")).write_text("", encoding="utf-8")
+    check("兩種都跑完才算審過",
+          dispatch.all_modes_done(jp3, ["visual", "code"]))
+    check("一種模式都沒派就不算審過", not dispatch.all_modes_done(jp3, []))
+
+    # --- 未追蹤的新檔案也要算進門檻（git diff 裡沒有它） ---
+    p4 = base / "threshnew"
+    (p4 / "src").mkdir(parents=True)
+    (p4 / ".claude" / "review").mkdir(parents=True)
+    env4 = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    (p4 / "src" / "seed.py").write_text("x = 1", encoding="utf-8")
+    for cmd in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "i"]):
+        subprocess.run(["git", "-C", str(p4)] + cmd, env=env4,
+                       capture_output=True, timeout=60)
+    newbig = p4 / "src" / "brand_new.py"
+    newbig.write_text("# " + "a" * 60000, encoding="utf-8")
+    from cross_review import common as _c
+    hit = dispatch.over_threshold(dict(_c.DEFAULT_CONFIG), p4, [str(newbig)], [], "HEAD")
+    check("未追蹤的大檔會觸發門檻", bool(hit), repr(hit))
+
 
 def scenario_breaker_and_usage(base: Path) -> None:
     """斷路器與用量帳本。錯誤訊息是 2026-09-02 額度真的用完時擷取的原文。"""
@@ -1377,6 +1419,26 @@ def scenario_breaker_and_usage(base: Path) -> None:
     check("那個模式自己成功就解除自己的暫停",
           breaker.paused_note(proj3, "code") == "", breaker.paused_note(proj3, "code"))
 
+    # 兩個模式各自跳閘時，後跳的那個不可以蓋掉前一個的暫停——
+    # 失敗計數分了模式、暫停狀態卻共用一組的話，還在壞的那個會提前恢復。
+    proj6 = base / "breakerproj6"
+    (proj6 / ".claude" / "review").mkdir(parents=True)
+    for _ in range(3):
+        breaker.record_failure(proj6, "boom", "code")
+    for _ in range(3):
+        breaker.record_failure(proj6, "boom", "visual")
+    check("後跳閘的模式不會蓋掉先跳閘的",
+          breaker.paused_note(proj6, "code") != ""
+          and breaker.paused_note(proj6, "visual") != "",
+          "code=%r visual=%r" % (breaker.paused_note(proj6, "code"),
+                                 breaker.paused_note(proj6, "visual")))
+    breaker.record_success(proj6, "visual")
+    check("解除一個模式不會連帶解除另一個",
+          breaker.paused_note(proj6, "code") != ""
+          and breaker.paused_note(proj6, "visual") == "",
+          "code=%r visual=%r" % (breaker.paused_note(proj6, "code"),
+                                 breaker.paused_note(proj6, "visual")))
+
     # 短暫限流沒有恢復時間就不該當成額度耗盡而停一小時。
     proj4 = base / "breakerproj4"
     (proj4 / ".claude" / "review").mkdir(parents=True)
@@ -1433,6 +1495,14 @@ def scenario_breaker_and_usage(base: Path) -> None:
           usage.read_rows(projn))
     check("--usage 不會被那種行弄崩", "共 1 次審查" in usage.summary(projn),
           usage.summary(projn).splitlines()[:3])
+
+    # 欄位型別不對的另一種：model 是數字時，summary() 的字串相接會 TypeError。
+    projt = base / "usagetype"
+    (projt / ".claude" / "review").mkdir(parents=True)
+    (projt / ".claude" / "review" / "usage.jsonl").write_text(
+        '{"tokens":1,"seconds":1,"model":123,"effort":"high"}', encoding="utf-8")
+    check("model 是數字時 --usage 也不會崩",
+          "共 1 次審查" in usage.summary(projt), usage.summary(projt)[:60])
 
     # 一般錯誤要連續三次才跳閘。
     proj2 = base / "breakerproj2"

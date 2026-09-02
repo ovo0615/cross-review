@@ -44,13 +44,28 @@ def next_round(project: Path, state: dict) -> int:
     return highest + 1
 
 
+def all_modes_done(job_path, modes: list) -> bool:
+    """每一種審查都產出報告了嗎。
+
+    只要有一種沒跑完就不能推進水位線：那批改動沒有被那一種審查看過，
+    而使用者看到的會是「審過了」。
+    """
+    if not modes:
+        return False
+    return all((job_path.with_suffix("." + m + ".done")).exists() for m in modes)
+
+
 def write_receipt(project: Path, job: dict, head_sha: str) -> None:
     """手動觸發的審查跑完後留下的收據，由 hook 在下一次 Stop 兌現。"""
     common.write_json(common.review_dir(project) / RECEIPT, {
         "round": job.get("round", 0),
         "transcript": job.get("transcript", ""),
         "end_line": job.get("end_line", 0),
-        "watermark": time.time(),
+        # 一定要用**派工當下**的時刻，不能用現在。審查要跑 150～650 秒，
+        # 這段期間執行者又改的檔案沒進材料包（工作單早就釘死了），
+        # 用審完的時刻當水位線會把它們算成已審，下一輪永遠看不到——
+        # 而且不會有任何訊息。自動那條路用的就是派工當下（hook 的 now）。
+        "watermark": float(job.get("dispatched") or 0) or time.time(),
         "head_sha": head_sha,
         "deleted": job.get("deleted") or [],
         "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -76,6 +91,8 @@ def create_job(project: Path, round_no: int, transcript_path: str, cursor: int,
         "start_line": cursor,
         "end_line": end_line,
         "since": watermark,
+        # 派工當下的時刻。手動觸發時由收據沿用它當新的水位線。
+        "dispatched": time.time(),
         # 這一輪的起點是「**上一次審查當下**的 HEAD」，不是現在的 HEAD。
         # hook 在回合結束時才跑，那時執行者可能已經把這一輪 commit 掉了，
         # 拿當下的 HEAD 當基準，diff 只會剩下 commit 之後的零星改動。
@@ -112,10 +129,28 @@ def over_threshold(cfg: dict, project: Path, files: list, deletions: list,
     if n >= limit_files:
         return "累積 " + str(n) + " 個檔案（門檻 " + str(limit_files) + "）"
     limit_bytes = common.positive_int(cfg, "auto_when_diff_bytes", 1)
-    if files and (project / ".git").exists():
-        size = len(tx.git_diff(project, 10_000_000, files,
-                               base=base_sha or "HEAD").encode("utf-8"))
-        if size >= limit_bytes:
-            return ("改動量 " + str(size // 1024) + " KB（門檻 "
-                    + str(limit_bytes // 1024) + " KB）")
+    if not files:
+        return ""
+    text = ""
+    if (project / ".git").exists():
+        text = tx.git_diff(project, 10_000_000, files, base=base_sha or "HEAD")
+    size = len(text.encode("utf-8"))
+    # 只量 diff 會漏掉新增的檔案：未追蹤的檔案根本不在 git diff 裡，
+    # 於是一個 60 KB 的全新檔案量出來是 0，兩個門檻都擋不住它。
+    # 非 git 專案更是完全沒有 diff。沒被 diff 涵蓋的就用檔案實際大小算。
+    covered = tx.diff_covers(text, project) if text else set()
+    for path in files:
+        try:
+            resolved = str(Path(path).resolve())
+        except OSError:
+            continue
+        if resolved in covered:
+            continue
+        try:
+            size += Path(path).stat().st_size
+        except OSError:
+            pass
+    if size >= limit_bytes:
+        return ("改動量 " + str(size // 1024) + " KB（門檻 "
+                + str(limit_bytes // 1024) + " KB）")
     return ""
