@@ -44,7 +44,18 @@ class WebSocket:
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
         self._buf = b""
+        try:
+            self._handshake(host, port, path)
+        except BaseException:
+            # 握手失敗時 self.ws 還沒被指派，Browser.close() 關不到這個 socket，
+            # 只能等垃圾回收——反覆失敗就會暫時累積描述元。自己收乾淨。
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            raise
 
+    def _handshake(self, host: str, port: int, path: str) -> None:
         key = base64.b64encode(os.urandom(16)).decode()
         request = (
             "GET " + path + " HTTP/1.1\r\n"
@@ -154,6 +165,20 @@ def _bypass_list() -> str:
     return ";".join(dict.fromkeys(entries))
 
 
+def _resolver_rules() -> str:
+    """給 --host-resolver-rules 用。
+
+    `MAP *` 會把 **IP 字面值也一起** 映射掉，所以每一個本機主機都要
+    個別 EXCLUDE。先前只寫了 EXCLUDE localhost，結果 localhost:埠 能用、
+    127.0.0.1:埠 直接連不上——而白名單明明兩個都接受。
+    政策允許了實作做不到的事，而且因為測試一直用 localhost 所以沒現形。
+    """
+    excludes = []
+    for host in sorted(LOCAL_HOSTS):
+        excludes.append("EXCLUDE " + host.strip("[]"))
+    return "MAP * ~NOTFOUND, " + ", ".join(dict.fromkeys(excludes))
+
+
 # 對本機除錯埠的請求絕不能走系統 proxy。
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -209,7 +234,7 @@ class Browser:
             #   1. 所有主機名稱解析失敗，localhost 例外（擋掉用網域的外連）
             #   2. 非本機的流量一律走一個沒有人在聽的 proxy（連 IP 直連也擋掉）
             args += [
-                "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost",
+                "--host-resolver-rules=" + _resolver_rules(),
                 "--proxy-server=http://127.0.0.1:1",
                 "--proxy-bypass-list=" + _bypass_list(),
             ]
@@ -218,6 +243,7 @@ class Browser:
         self.proc = None
         self.ws = None
         self._id = 0
+        self._events = []
         try:
             self.proc = subprocess.Popen(
                 args,
@@ -264,31 +290,74 @@ class Browser:
                 "Chrome 回報的除錯 WebSocket 不在本機，拒絕連線：" + ws_url)
         self.ws = WebSocket(ws_url, timeout=self.timeout)
 
+    # 等指令回應時收到的事件先存這裡，不能丟掉。
+    # 丟掉的話會有一個真實的競爭：Page.loadEventFired 只要比 Page.navigate
+    # 的回應早到，就永遠消失，goto() 接著等一個已經過去的事件，
+    # 一路等到 socket 逾時才拋例外——原本載入成功的畫面被判成審查失敗。
+    MAX_QUEUED_EVENTS = 200
+
+    def _queue_event(self, data: dict) -> None:
+        if "method" not in data:
+            return                      # 別的指令的回應，跟我們無關
+        self._events.append(data)
+        if len(self._events) > self.MAX_QUEUED_EVENTS:
+            del self._events[0]         # 頁面狂噴事件時不要無限成長
+
     def call(self, method: str, params: dict = None, timeout: float = None):
-        """送一個 CDP 指令，等它自己的回應（沿路的事件先擱著）。"""
+        """送一個 CDP 指令，等它自己的回應。
+
+        沿路收到的事件會**存進佇列**（不是丟掉），讓 goto() 之類的等待者
+        事後查得到。先前這裡直接 continue，那正是上面那個競爭的來源。
+        """
         self._id += 1
         msg_id = self._id
         self.ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
         deadline = time.time() + (timeout or self.timeout)
         while time.time() < deadline:
-            data = json.loads(self.ws.recv())
+            try:
+                data = json.loads(self.ws.recv())
+            except socket.timeout:
+                continue                # 由外層的 deadline 決定要不要放棄
             if data.get("id") != msg_id:
-                continue          # 這是事件或別的回應
+                self._queue_event(data)
+                continue
             if "error" in data:
                 raise RuntimeError(method + " 失敗：" + json.dumps(data["error"], ensure_ascii=False))
             return data.get("result", {})
         raise TimeoutError(method + " 逾時")
 
     # -------------------------------------------------- 高階操作
+    LOAD_EVENTS = ("Page.loadEventFired", "Page.frameStoppedLoading")
+
     def goto(self, url: str, settle_ms: int = 1200) -> None:
+        """導覽到 url，等載入事件，然後再靜置一小段時間。
+
+        等不到載入事件時**真的**會靠 settle 兜底——先前的註解這樣寫，
+        但程式碼做不到：ws.recv() 逾時會拋例外，根本走不到那行 sleep。
+        現在 socket 逾時被捕捉，行為與說明一致。
+        """
         self.call("Page.enable")
+        # 佇列一定要在 navigate 之前清掉。上一頁殘留的 loadEventFired
+        # 會讓這一次的等待立刻「成功」，畫面根本還沒換。
+        self._events.clear()
         self.call("Page.navigate", {"url": url})
-        # 等 load 事件；等不到就靠 settle 的固定時間兜底，不要整個卡死。
+
+        # 先查佇列——載入事件可能在等 navigate 回應時就已經到了。
+        if any(e.get("method") in self.LOAD_EVENTS for e in self._events):
+            time.sleep(settle_ms / 1000.0)
+            return
+
         deadline = time.time() + self.timeout
         while time.time() < deadline:
-            data = json.loads(self.ws.recv())
-            if data.get("method") in ("Page.loadEventFired", "Page.frameStoppedLoading"):
+            try:
+                data = json.loads(self.ws.recv())
+            except socket.timeout:
+                break                   # 等不到就走 settle，不要整個卡死
+            except Exception:
                 break
+            if data.get("method") in self.LOAD_EVENTS:
+                break
+            self._queue_event(data)
         time.sleep(settle_ms / 1000.0)
 
     def eval(self, expression: str):

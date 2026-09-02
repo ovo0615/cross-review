@@ -355,6 +355,18 @@ def scenario_boundaries(base: Path) -> None:
                   if ("[::1]" if h == "::1" else h) not in bypass]
     check("每個本機主機都在 proxy bypass 清單裡", not mismatched, str(mismatched))
 
+    # host-resolver-rules 的 MAP * 會把 IP 字面值也一起映射掉，
+    # 所以每個本機主機都要個別 EXCLUDE。先前只寫了 EXCLUDE localhost，
+    # 結果 localhost:埠 能用、127.0.0.1:埠 直接連不上——而白名單兩個都接受。
+    # 政策允許了實作做不到的事，因為測試一直用 localhost 所以一直沒現形。
+    from cross_review.cdp import _resolver_rules
+    rules = _resolver_rules()
+    missing_excludes = [h for h in LOCAL_HOSTS
+                        if ("EXCLUDE " + h.strip("[]")) not in rules]
+    check("每個本機主機都被 host-resolver-rules 排除",
+          not missing_excludes, str(missing_excludes) + " / " + rules)
+    check("非本機仍然被解析規則擋掉", rules.startswith("MAP * ~NOTFOUND"), rules)
+
     # 安全旗標不能用 truthiness：字串 "false" 是 truthy，
     # 邊界會被靜默打開而使用者以為自己關著。
     from cross_review.shots import as_bool
@@ -1010,6 +1022,95 @@ def scenario_hardening(base: Path) -> None:
           not any("x.py" in h for h in hits), str(hits))
 
 
+def scenario_cdp_events(base: Path) -> None:
+    """CDP 的事件佇列。重現審查者抓到的那個競爭，不需要真的 Chrome。
+
+    競爭是這樣：call() 等自己的回應時若把沿路的事件丟掉，
+    Page.loadEventFired 只要比 Page.navigate 的回應早到就永遠消失，
+    goto() 接著等一個已經過去的事件，一路等到 socket 逾時。
+    原本載入成功的畫面因此被判成審查失敗。
+    """
+    import json as _json
+    import socket as _socket
+    sys.path.insert(0, str(TOOL_ROOT))
+    from cross_review.cdp import Browser
+
+    class FakeWS:
+        """照腳本回訊息；腳本用完就丟 socket.timeout（模擬沒有新訊息）。"""
+
+        def __init__(self, script):
+            self.script = list(script)
+            self.sent = []
+            self.recv_calls = 0
+
+        def send(self, text):
+            self.sent.append(_json.loads(text))
+
+        def recv(self):
+            self.recv_calls += 1
+            if not self.script:
+                raise _socket.timeout("沒有更多訊息")
+            return _json.dumps(self.script.pop(0))
+
+    def make(script):
+        b = Browser.__new__(Browser)      # 不要真的啟動 Chrome
+        b.ws = FakeWS(script)
+        b.timeout = 1.0
+        b._id = 0
+        b._events = []
+        return b
+
+    # --- call() 必須把事件存起來，不是丟掉 ---
+    b = make([{"method": "Page.loadEventFired"}, {"id": 1, "result": {"ok": True}}])
+    result = b.call("Page.enable")
+    check("call() 拿得到自己的回應", result == {"ok": True}, str(result))
+    check("沿路的事件被存進佇列（不是丟掉）",
+          [e.get("method") for e in b._events] == ["Page.loadEventFired"],
+          str(b._events))
+
+    # --- 競爭本身：載入事件比 navigate 的回應早到 ---
+    b = make([
+        {"id": 1, "result": {}},                 # Page.enable 的回應
+        {"method": "Page.loadEventFired"},       # 早到的載入事件
+        {"id": 2, "result": {}},                 # Page.navigate 的回應
+    ])
+    started = time.time()
+    b.goto("http://localhost:1/", settle_ms=0)
+    elapsed = time.time() - started
+    check("載入事件早到時 goto() 仍然認得（競爭已修）",
+          elapsed < 0.5, "花了 %.2f 秒，代表退化成等逾時" % elapsed)
+    check("goto() 沒有多讀不存在的訊息",
+          b.ws.recv_calls == 3, str(b.ws.recv_calls))
+
+    # --- navigate 之前要清掉上一頁殘留的事件 ---
+    b = make([{"id": 1, "result": {}}, {"id": 2, "result": {}}])
+    b._events.append({"method": "Page.loadEventFired"})   # 上一頁殘留的
+    b.goto("http://localhost:1/", settle_ms=0)
+    check("上一頁殘留的載入事件不會讓這次的等待立刻成功",
+          b.ws.recv_calls > 2,
+          "只讀了 %d 次，代表拿殘留事件充數" % b.ws.recv_calls)
+
+    # --- 等不到載入事件時要走 settle 兜底，不是拋例外 ---
+    b = make([{"id": 1, "result": {}}, {"id": 2, "result": {}}])
+    try:
+        b.goto("http://localhost:1/", settle_ms=0)
+        check("等不到載入事件時走 settle 兜底而不是拋例外", True)
+    except Exception as exc:
+        check("等不到載入事件時走 settle 兜底而不是拋例外", False, repr(exc))
+
+    # --- 佇列要有上限，頁面狂噴事件時不能無限成長 ---
+    b = make([])
+    for i in range(Browser.MAX_QUEUED_EVENTS + 50):
+        b._queue_event({"method": "Some.event", "n": i})
+    check("事件佇列有上限", len(b._events) == Browser.MAX_QUEUED_EVENTS,
+          str(len(b._events)))
+    check("超過上限時丟掉最舊的", b._events[-1]["n"] == Browser.MAX_QUEUED_EVENTS + 49,
+          str(b._events[-1]))
+    b._queue_event({"id": 99, "result": {}})
+    check("指令回應不會被當成事件存起來",
+          all("method" in e for e in b._events))
+
+
 def main() -> int:
     base = Path(tempfile.mkdtemp(prefix="crossreview_test_"))
     try:
@@ -1020,6 +1121,7 @@ def main() -> int:
         scenario_pinning(base)
         scenario_usage(base)
         scenario_hardening(base)
+        scenario_cdp_events(base)
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
