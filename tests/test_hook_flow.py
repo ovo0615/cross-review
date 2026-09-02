@@ -1036,62 +1036,108 @@ def scenario_cdp_events(base: Path) -> None:
     from cross_review.cdp import Browser
 
     class FakeWS:
-        """照腳本回訊息；腳本用完就丟 socket.timeout（模擬沒有新訊息）。"""
+        """模擬 CDP 端點。
 
-        def __init__(self, script):
-            self.script = list(script)
+        responses：method -> 該指令的 result
+        inject   ：(在哪個 method 的回應之前, 要插入的事件)
+                   ——這正是競爭的形狀：事件比指令回應早到。
+        腳本用完就丟 socket.timeout（模擬沒有新訊息）。
+        """
+
+        def __init__(self, responses=None, inject=None):
+            self.responses = responses or {}
+            self.inject = list(inject or [])
+            self.pending = []
             self.sent = []
             self.recv_calls = 0
 
         def send(self, text):
-            self.sent.append(_json.loads(text))
+            msg = _json.loads(text)
+            self.sent.append(msg)
+            for after, event in self.inject:
+                if after == msg["method"]:
+                    self.pending.append(event)
+            self.pending.append(
+                {"id": msg["id"], "result": self.responses.get(msg["method"], {})})
 
         def recv(self):
             self.recv_calls += 1
-            if not self.script:
+            if not self.pending:
                 raise _socket.timeout("沒有更多訊息")
-            return _json.dumps(self.script.pop(0))
+            return _json.dumps(self.pending.pop(0))
 
-    def make(script):
+    def make(responses=None, inject=None):
         b = Browser.__new__(Browser)      # 不要真的啟動 Chrome
-        b.ws = FakeWS(script)
+        b.ws = FakeWS(responses, inject)
         b.timeout = 1.0
         b._id = 0
         b._events = []
         return b
 
+    NAV = {"loaderId": "L-NEW", "frameId": "F-NEW"}
+
     # --- call() 必須把事件存起來，不是丟掉 ---
-    b = make([{"method": "Page.loadEventFired"}, {"id": 1, "result": {"ok": True}}])
+    b = make({"Page.enable": {"ok": True}},
+             [("Page.enable", {"method": "Page.loadEventFired"})])
     result = b.call("Page.enable")
     check("call() 拿得到自己的回應", result == {"ok": True}, str(result))
     check("沿路的事件被存進佇列（不是丟掉）",
           [e.get("method") for e in b._events] == ["Page.loadEventFired"],
           str(b._events))
 
-    # --- 競爭本身：載入事件比 navigate 的回應早到 ---
-    b = make([
-        {"id": 1, "result": {}},                 # Page.enable 的回應
-        {"method": "Page.loadEventFired"},       # 早到的載入事件
-        {"id": 2, "result": {}},                 # Page.navigate 的回應
-    ])
-    started = time.time()
+    # --- 競爭本身：這一次導航的載入事件比 navigate 的回應早到 ---
+    b = make({"Page.navigate": NAV},
+             [("Page.navigate", {"method": "Page.lifecycleEvent",
+                                 "params": {"name": "load", "loaderId": "L-NEW"}})])
     b.goto("http://localhost:1/", settle_ms=0)
-    elapsed = time.time() - started
+    # 判斷成功與否只看「有沒有多讀不存在的訊息」，不要用牆鐘時間——
+    # 那在忙碌的機器上會偶發失敗，而且它證明不了任何邏輯。
     check("載入事件早到時 goto() 仍然認得（競爭已修）",
-          elapsed < 0.5, "花了 %.2f 秒，代表退化成等逾時" % elapsed)
-    check("goto() 沒有多讀不存在的訊息",
-          b.ws.recv_calls == 3, str(b.ws.recv_calls))
+          b.ws.recv_calls == 4,
+          "讀了 %d 次，預期 4 次（enable／lifecycle／事件／navigate）" % b.ws.recv_calls)
+
+    # --- 上一頁的停止事件在清空「之後」抵達，不能被當成這一次完成 ---
+    # 這是只清空佇列擋不住的那一半。
+    b = make({"Page.navigate": NAV},
+             [("Page.navigate", {"method": "Page.frameStoppedLoading",
+                                 "params": {"frameId": "F-OLD"}})])
+    b.goto("http://localhost:1/", settle_ms=0)
+    check("別的 frame 的停止事件不會被當成這一次導航完成",
+          b.ws.recv_calls > 4,
+          "只讀了 %d 次，代表拿舊事件充數" % b.ws.recv_calls)
+
+    # --- 同一個 frame 的停止事件才算數 ---
+    b = make({"Page.navigate": NAV},
+             [("Page.navigate", {"method": "Page.frameStoppedLoading",
+                                 "params": {"frameId": "F-NEW"}})])
+    b.goto("http://localhost:1/", settle_ms=0)
+    check("同一個 frame 的停止事件算數", b.ws.recv_calls == 4, str(b.ws.recv_calls))
+
+    # --- 拿不到 loaderId／frameId 時才退回採信 loadEventFired ---
+    b = make({"Page.navigate": {}},
+             [("Page.navigate", {"method": "Page.loadEventFired"})])
+    b.goto("http://localhost:1/", settle_ms=0)
+    check("沒有識別可關聯時才採信 loadEventFired",
+          b.ws.recv_calls == 4, str(b.ws.recv_calls))
+
+    b = make({"Page.navigate": NAV},
+             [("Page.navigate", {"method": "Page.loadEventFired"})])
+    b.goto("http://localhost:1/", settle_ms=0)
+    check("有識別可關聯時就不採信沒帶識別的 loadEventFired",
+          b.ws.recv_calls > 4,
+          "只讀了 %d 次，代表用了關聯不上的事件" % b.ws.recv_calls)
 
     # --- navigate 之前要清掉上一頁殘留的事件 ---
-    b = make([{"id": 1, "result": {}}, {"id": 2, "result": {}}])
-    b._events.append({"method": "Page.loadEventFired"})   # 上一頁殘留的
+    b = make({"Page.navigate": NAV})
+    b._events.append({"method": "Page.lifecycleEvent",
+                      "params": {"name": "load", "loaderId": "L-NEW"}})
     b.goto("http://localhost:1/", settle_ms=0)
-    check("上一頁殘留的載入事件不會讓這次的等待立刻成功",
-          b.ws.recv_calls > 2,
+    check("清空之前的殘留事件不會讓這次的等待立刻成功",
+          b.ws.recv_calls > 3,
           "只讀了 %d 次，代表拿殘留事件充數" % b.ws.recv_calls)
 
     # --- 等不到載入事件時要走 settle 兜底，不是拋例外 ---
-    b = make([{"id": 1, "result": {}}, {"id": 2, "result": {}}])
+    b = make({"Page.navigate": NAV})
     try:
         b.goto("http://localhost:1/", settle_ms=0)
         check("等不到載入事件時走 settle 兜底而不是拋例外", True)
@@ -1099,7 +1145,7 @@ def scenario_cdp_events(base: Path) -> None:
         check("等不到載入事件時走 settle 兜底而不是拋例外", False, repr(exc))
 
     # --- 佇列要有上限，頁面狂噴事件時不能無限成長 ---
-    b = make([])
+    b = make()
     for i in range(Browser.MAX_QUEUED_EVENTS + 50):
         b._queue_event({"method": "Some.event", "n": i})
     check("事件佇列有上限", len(b._events) == Browser.MAX_QUEUED_EVENTS,
@@ -1109,6 +1155,28 @@ def scenario_cdp_events(base: Path) -> None:
     b._queue_event({"id": 99, "result": {}})
     check("指令回應不會被當成事件存起來",
           all("method" in e for e in b._events))
+
+    # --- 視埠尺寸必須完全等於設定值（要真的開 Chrome 才測得到）---
+    # --window-size 給的是視窗大小，可視區還要扣掉瀏覽器自己的東西。
+    # 加上網路隔離旗標後 Chrome 多一條提示列，可視高度從 804 掉到 748——
+    # 同一份設定、同一個 --window-size，截圖卻小了 56 px。
+    # 視覺回歸整個功能的前提就是尺寸穩定，所以這一項不能只靠結構檢查。
+    import struct as _struct
+    from cross_review.shots import resolve_chrome as _chrome
+    chrome = _chrome()
+    if not chrome:
+        check("找得到 Chrome 才能驗視埠", False, "找不到 chrome.exe")
+    else:
+        shot = base / "viewport.png"
+        for w, h, local_only in ((900, 640, True), (900, 640, False)):
+            with Browser(chrome, w, h, local_only=local_only) as br:
+                br.goto("about:blank", settle_ms=100)
+                br.screenshot(shot)
+            head = shot.read_bytes()[:33]
+            got = _struct.unpack(">II", head[16:24])
+            check("視埠等於設定值（local_only=%s）" % local_only,
+                  got == (w, h), "拿到 %sx%s，預期 %sx%s" % (got[0], got[1], w, h))
+        shot.unlink()
 
 
 def main() -> int:

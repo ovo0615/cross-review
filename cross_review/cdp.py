@@ -251,6 +251,7 @@ class Browser:
                 stderr=subprocess.DEVNULL,
             )
             self._connect()
+            self._force_viewport(width, height)
         except BaseException:
             # 建構子拋例外時 close() 永遠不會被呼叫，呼叫端的 finally 也
             # 因為變數還沒被賦值而清不掉——Chrome 行程與暫存 profile 就留下來了。
@@ -303,6 +304,25 @@ class Browser:
         if len(self._events) > self.MAX_QUEUED_EVENTS:
             del self._events[0]         # 頁面狂噴事件時不要無限成長
 
+    def _force_viewport(self, width: int, height: int) -> None:
+        """用 CDP 明確指定視埠，不要依賴 --window-size。
+
+        `--window-size` 給的是**視窗**大小，實際的可視區還要扣掉瀏覽器自己的
+        東西。實測：加上網路隔離旗標之後，Chrome 多出一條提示列，
+        可視高度從 804 掉到 748——同一份設定、同一個 --window-size，
+        截圖卻小了 56 px，而視覺回歸整個功能的前提就是尺寸穩定。
+        （這是視覺審查在工具自己身上抓到的：它報告「所有截圖比基準少 56 px」。）
+
+        setDeviceMetricsOverride 直接規定可視區，瀏覽器有沒有提示列、
+        有沒有捲軸都不影響，截圖尺寸完全等於設定值。
+        """
+        self.call("Emulation.setDeviceMetricsOverride", {
+            "width": int(width),
+            "height": int(height),
+            "deviceScaleFactor": 1,
+            "mobile": False,
+        })
+
     def call(self, method: str, params: dict = None, timeout: float = None):
         """送一個 CDP 指令，等它自己的回應。
 
@@ -327,23 +347,55 @@ class Browser:
         raise TimeoutError(method + " 逾時")
 
     # -------------------------------------------------- 高階操作
-    LOAD_EVENTS = ("Page.loadEventFired", "Page.frameStoppedLoading")
+    @staticmethod
+    def _is_this_navigation(event: dict, loader_id: str, frame_id: str) -> bool:
+        """這個事件是不是「這一次」導航完成的證據。
+
+        只清空佇列是不夠的：上一頁的停止事件若在清空之後、navigate 回應
+        之前才抵達，一樣會被誤認成新頁載入完成，然後拍到還沒載入完的畫面。
+
+        關聯的方式看事件本身帶不帶識別：
+          - Page.lifecycleEvent 帶 loaderId，可以精確關聯（要先 enable）
+          - Page.frameStoppedLoading 帶 frameId，可以關聯
+          - Page.loadEventFired **不帶任何識別**，所以只有在我們根本拿不到
+            loaderId 與 frameId 時才採信它——有更好的證據就不用猜的。
+        """
+        method = event.get("method")
+        params = event.get("params") or {}
+        if method == "Page.lifecycleEvent":
+            if params.get("name") not in ("load", "networkIdle"):
+                return False
+            return not loader_id or params.get("loaderId") == loader_id
+        if method == "Page.frameStoppedLoading":
+            return not frame_id or params.get("frameId") == frame_id
+        if method == "Page.loadEventFired":
+            return not loader_id and not frame_id
+        return False
 
     def goto(self, url: str, settle_ms: int = 1200) -> None:
-        """導覽到 url，等載入事件，然後再靜置一小段時間。
+        """導覽到 url，等**這一次**導航的載入事件，然後再靜置一小段時間。
 
-        等不到載入事件時**真的**會靠 settle 兜底——先前的註解這樣寫，
+        等不到載入事件時真的會靠 settle 兜底——先前的註解這樣寫，
         但程式碼做不到：ws.recv() 逾時會拋例外，根本走不到那行 sleep。
         現在 socket 逾時被捕捉，行為與說明一致。
         """
         self.call("Page.enable")
-        # 佇列一定要在 navigate 之前清掉。上一頁殘留的 loadEventFired
-        # 會讓這一次的等待立刻「成功」，畫面根本還沒換。
-        self._events.clear()
-        self.call("Page.navigate", {"url": url})
+        # lifecycleEvent 是唯一帶 loaderId 的載入事件，沒有它就只能靠
+        # frameId 或猜。enable 失敗不致命，退回 frameStoppedLoading。
+        try:
+            self.call("Page.setLifecycleEventsEnabled", {"enabled": True})
+        except Exception:
+            pass
 
-        # 先查佇列——載入事件可能在等 navigate 回應時就已經到了。
-        if any(e.get("method") in self.LOAD_EVENTS for e in self._events):
+        # 佇列在 navigate 之前清掉，擋掉「清空之前」的殘留；
+        # 「清空之後」才抵達的殘留由 loaderId／frameId 關聯擋掉。
+        self._events.clear()
+        result = self.call("Page.navigate", {"url": url})
+        loader_id = str(result.get("loaderId") or "")
+        frame_id = str(result.get("frameId") or "")
+
+        # 先查佇列——這一次的載入事件可能在等 navigate 回應時就已經到了。
+        if any(self._is_this_navigation(e, loader_id, frame_id) for e in self._events):
             time.sleep(settle_ms / 1000.0)
             return
 
@@ -355,7 +407,7 @@ class Browser:
                 break                   # 等不到就走 settle，不要整個卡死
             except Exception:
                 break
-            if data.get("method") in self.LOAD_EVENTS:
+            if self._is_this_navigation(data, loader_id, frame_id):
                 break
             self._queue_event(data)
         time.sleep(settle_ms / 1000.0)
