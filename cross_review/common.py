@@ -242,10 +242,23 @@ def is_inside(child: str, parent: Path) -> bool:
 
 
 # ---------------------------------------------------------------- 專案設定
+# 什麼時候送審。實測每次審查約 11 萬 tokens、170～650 秒，
+# 每一輪都審在小修時完全不划算——這是成本上最大的一個槓桿。
+#   "auto"      有改動就攔阻，非審不可。交付前的收尾用。
+#   "manual"    永不攔阻，只報累積量，使用者說了才送。
+#   "threshold" 平常同 manual，累積超過門檻時自動送一次。
+# 預設是 threshold 而不是 manual：純手動有一個很具體的失效方式——會忘記，
+# 而「忘記送審」跟「審過了沒問題」在畫面上長得一模一樣。門檻是安全網，
+# 只保證不會漏，不判斷值不值得。
+TRIGGERS = ("auto", "manual", "threshold")
+
 DEFAULT_CONFIG = {
     "enabled": True,
     "code_review": True,
     "visual_review": True,
+    "trigger": "threshold",
+    "auto_when_files": 10,
+    "auto_when_diff_bytes": 20_480,   # 20 KB
     # 材料包上限（第 14 題）。超過就截斷，並在報告開頭強制標明。
     "max_files": 40,
     "max_bytes": 200_000,

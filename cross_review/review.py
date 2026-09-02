@@ -14,7 +14,8 @@ import sys
 import time
 from pathlib import Path
 
-from . import breaker, common, shots as shots_mod, transcript as tx, usage
+from . import (breaker, common, dispatch, shots as shots_mod,
+               transcript as tx, usage)
 
 SCHEMA_DIR = Path(__file__).parent / "schemas"
 
@@ -875,3 +876,94 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def run_now(project: Path) -> int:
+    """使用者手動觸發：把累積至今的改動組成一份工作單，當場審完。
+
+    不依賴 hook 產生的工作單——手動／門檻模式下 hook 根本不會建。
+    跑完只寫收據（reviewed.json），不碰 state.json：hook 也在寫那個檔案，
+    兩個行程各自寫會互相覆蓋，這是斷路器狀態當初必須拆檔的同一個理由。
+    """
+    project = Path(project).resolve()
+    if not common.review_dir_is_safe(project):
+        print("⚠️ " + str(common.review_dir(project)) + " 指向專案外部，拒絕動作。")
+        return 1
+    cfg = common.ensure_config(project)
+    state = common.load_state(project)
+    transcript_path = state.get("transcript") or ""
+
+    watermark = float(state.get("watermark", 0.0))
+    if not watermark and transcript_path:
+        try:
+            watermark = Path(transcript_path).stat().st_ctime
+        except OSError:
+            watermark = 0.0
+
+    _parsed, end_line, files, deleted = dispatch.detect(
+        project, transcript_path, int(state.get("cursor", 0)), watermark)
+    reported = {p for p in (state.get("reported_deletions") or [])
+                if not Path(p).exists()}
+    deletions = [p for p in deleted if p not in reported]
+    if not files and not deletions:
+        print("沒有累積的改動，這一次不用審查。")
+        return 0
+
+    round_no = dispatch.next_round(project, state)
+    head_now = tx.git_head(project)
+    job_path = dispatch.create_job(
+        project, round_no, transcript_path, int(state.get("cursor", 0)),
+        end_line, watermark, files, deletions,
+        base_sha=state.get("head_sha") or head_now)
+    job = common.read_json(job_path) or {}
+
+    modes = []
+    if cfg.get("visual_review", True) and cfg.get("shots"):
+        modes.append("visual")
+    if cfg.get("code_review", True):
+        modes.append("code")
+
+    worst = 0
+    for mode in modes:
+        if breaker.paused_note(project, mode):
+            print("⛔ " + breaker.paused_note(project, mode))
+            worst = worst or 1
+            continue
+        common.write_text(job_path.with_suffix("." + mode + ".started"), "")
+        code = run_visual(project, job, cfg) if mode == "visual" \
+            else run_code(project, job, cfg)
+        if code == 0:
+            common.write_text(job_path.with_suffix("." + mode + ".done"), "")
+        else:
+            worst = code
+
+    # 只要有一種審查真的產出了報告，這一批就算審過了，水位線可以往前。
+    # 全部失敗就不留收據——那批改動要留在累積裡，下次還看得到。
+    if any(job_path.with_suffix("." + m + ".done").exists() for m in modes):
+        dispatch.write_receipt(project, job, head_now)
+    return worst
+
+
+def set_trigger(project: Path, mode: str) -> int:
+    """改這個專案的觸發模式（/cross-review 用）。"""
+    project = Path(project).resolve()
+    if mode not in common.TRIGGERS:
+        print("觸發模式只能是：" + "、".join(common.TRIGGERS))
+        return 1
+    if not common.review_dir_is_safe(project):
+        print("⚠️ " + str(common.review_dir(project)) + " 指向專案外部，拒絕動作。")
+        return 1
+    cfg = common.ensure_config(project)
+    cfg["trigger"] = mode
+    common.write_json(common.review_dir(project) / "config.json", cfg)
+    explain = {
+        "auto": "有改動就攔阻，非審不可。",
+        "manual": "永不自動送審，只報累積量，你說了才送。",
+        "threshold": ("平常不送審；累積超過 "
+                      + str(common.positive_int(cfg, "auto_when_files", 1))
+                      + " 個檔案或 "
+                      + str(common.positive_int(cfg, "auto_when_diff_bytes", 1) // 1024)
+                      + " KB 改動時自動送一次。"),
+    }[mode]
+    print(str(project) + " 的觸發模式已設為 " + mode + "：" + explain)
+    return 0

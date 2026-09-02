@@ -56,6 +56,18 @@ def touch(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def force_auto(project: Path) -> None:
+    """把專案釘成 auto 觸發。
+
+    預設是 threshold（小改不送審），所以驗「有改動就攔阻」的情境必須
+    自己明講要 auto，否則測的其實是門檻沒跨過——那種綠燈什麼都沒證明。
+    """
+    rdir = project / ".claude" / "review"
+    rdir.mkdir(parents=True, exist_ok=True)
+    (rdir / "config.json").write_text(
+        json.dumps({"trigger": "auto"}, ensure_ascii=False), encoding="utf-8")
+
+
 def run_hook(project: Path, transcript: Path):
     payload = json.dumps({
         "cwd": str(project),
@@ -113,6 +125,7 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 def scenario_non_git(base: Path) -> None:
     project = base / "proj"
     (project / "src").mkdir(parents=True)
+    force_auto(project)
     (project / "src" / "app.py").write_text("print('hi')\n", encoding="utf-8")
     (project / "notes.md").write_text("# 純文件\n", encoding="utf-8")
 
@@ -147,7 +160,9 @@ def scenario_non_git(base: Path) -> None:
     rdir = project / ".claude" / "review"
     jobs = sorted(rdir.glob("job-*.json"))
     check("產生了工作單", len(jobs) == 1, str([p.name for p in rdir.iterdir()]))
-    check("產生了 config.json", (rdir / "config.json").exists())
+    # config.json 的產生改由 scenario_trigger_modes 驗（這裡已被 force_auto
+    # 先寫過，留在這裡只會是一條什麼都沒證明的綠燈）。
+    check("config.json 仍在", (rdir / "config.json").exists())
     if not jobs:
         return
     job = json.loads(jobs[0].read_text(encoding="utf-8"))
@@ -223,6 +238,7 @@ def scenario_non_git(base: Path) -> None:
 def scenario_git(base: Path) -> None:
     project = base / "gitproj"
     (project / "src").mkdir(parents=True)
+    force_auto(project)
     (project / "src" / "main.py").write_text("x = 1\n", encoding="utf-8")
     env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
@@ -531,6 +547,7 @@ def scenario_pinning(base: Path) -> None:
     (proj / "src").mkdir(parents=True)
     (proj / "src" / "gone.py").write_text("x = 1\n", encoding="utf-8")
     (proj / "src" / "stay.py").write_text("y = 1\n", encoding="utf-8")
+    force_auto(proj)
     env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
     for cmd in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "init"]):
@@ -1206,6 +1223,93 @@ def scenario_cdp_events(base: Path) -> None:
         shot.unlink()
 
 
+def scenario_trigger_modes(base: Path) -> None:
+    """手動／門檻觸發。
+
+    這一段要證明的核心是「不送審的那幾輪，改動不會消失」——累積量必須
+    一路長大，而不是被水位線推掉。漏掉的改動不會有任何錯誤訊息。
+    """
+    proj = base / "trigproj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "src" / "a.py").write_text("a = 1", encoding="utf-8")
+    time.sleep(0.05)
+    t = base / "trigsession.jsonl"
+    t.write_text("", encoding="utf-8")
+
+    # 全新專案沒有 config，hook 應該建一份，且預設是 threshold。
+    touch(proj / "src" / "a.py", "a = 2")
+    out, _ = run_hook(proj, t)
+    cfg_path = proj / ".claude" / "review" / "config.json"
+    check("全新專案會產生 config.json", cfg_path.exists())
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    check("預設觸發模式是 threshold", cfg.get("trigger") == "threshold", cfg.get("trigger"))
+    check("小改不攔阻", "decision" not in (out or {}), out)
+    check("小改會報累積量", "累積 1 個" in (out or {}).get("systemMessage", ""), out)
+
+    rdir = proj / ".claude" / "review"
+    check("沒送審就不建工作單",
+          not list(rdir.glob("job-*.json")), [f.name for f in rdir.glob("*")])
+
+    # 純手動：再改兩個檔，累積量要長到 3，不能被水位線推掉。
+    cfg_path.write_text(json.dumps({"trigger": "manual"}), encoding="utf-8")
+    before = json.loads((rdir / "state.json").read_text(encoding="utf-8"))
+    touch(proj / "src" / "b.py", "b = 1")
+    touch(proj / "src" / "c.py", "c = 1")
+    out, _ = run_hook(proj, t)
+    check("手動模式永不攔阻", "decision" not in (out or {}), out)
+    check("沒送審的改動會累積，不會消失",
+          "累積 3 個" in (out or {}).get("systemMessage", ""), out)
+    after = json.loads((rdir / "state.json").read_text(encoding="utf-8"))
+    check("沒送審就不推進水位線",
+          after.get("watermark") == before.get("watermark"),
+          (before.get("watermark"), after.get("watermark")))
+    check("沒送審就不推進回合編號",
+          after.get("round") == before.get("round"),
+          (before.get("round"), after.get("round")))
+
+    # 門檻：把門檻壓到 2，同一批累積就該自動送一次。
+    cfg_path.write_text(json.dumps({"trigger": "threshold", "auto_when_files": 2}),
+                        encoding="utf-8")
+    touch(proj / "src" / "a.py", "a = 3")
+    out, _ = run_hook(proj, t)
+    check("超過門檻會自動送審", (out or {}).get("decision") == "block", out)
+    check("自動送審要說明是門檻觸發的",
+          "門檻" in (out or {}).get("reason", ""), (out or {}).get("reason", "")[:120])
+    check("門檻觸發也會建工作單", bool(list(rdir.glob("job-*.json"))))
+
+
+def scenario_receipt(base: Path) -> None:
+    """手動觸發的審查跑完後，收據要由 hook 兌現。
+
+    審查行程不能直接改 state.json——hook 也在寫那個檔案，兩個行程互相覆蓋。
+    """
+    from cross_review import dispatch
+    proj = base / "receiptproj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "src" / "a.py").write_text("a = 1", encoding="utf-8")
+    rdir = proj / ".claude" / "review"
+    rdir.mkdir(parents=True, exist_ok=True)
+    (rdir / "config.json").write_text(json.dumps({"trigger": "manual"}),
+                                      encoding="utf-8")
+    time.sleep(0.05)
+    t = base / "receiptsession.jsonl"
+    t.write_text("", encoding="utf-8")
+
+    touch(proj / "src" / "a.py", "a = 2")
+    out, _ = run_hook(proj, t)
+    check("兌現前有累積", "累積 1 個" in (out or {}).get("systemMessage", ""), out)
+
+    # 假裝手動審查跑完了，留下收據。
+    dispatch.write_receipt(proj, {"round": 7, "transcript": str(t),
+                                  "end_line": 0, "deleted": []}, head_sha="abc123")
+    out, _ = run_hook(proj, t)
+    check("兌現收據後累積歸零", out is None or "累積" not in str(out), out)
+    st = json.loads((rdir / "state.json").read_text(encoding="utf-8"))
+    check("收據推進了回合編號", st.get("round") == 7, st.get("round"))
+    check("收據推進了 head_sha", st.get("head_sha") == "abc123", st.get("head_sha"))
+    check("收據只兌現一次", st.get("receipt_round") == 7, st.get("receipt_round"))
+
+
 def scenario_breaker_and_usage(base: Path) -> None:
     """斷路器與用量帳本。錯誤訊息是 2026-09-02 額度真的用完時擷取的原文。"""
     sys.path.insert(0, str(TOOL_ROOT))
@@ -1374,6 +1478,8 @@ def main() -> int:
         scenario_usage(base)
         scenario_hardening(base)
         scenario_cdp_events(base)
+        scenario_trigger_modes(base)
+        scenario_receipt(base)
         scenario_breaker_and_usage(base)
     finally:
         shutil.rmtree(base, ignore_errors=True)

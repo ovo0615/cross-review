@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import breaker, common, transcript as tx
+from . import breaker, common, dispatch, transcript as tx
 
 TOOL_ROOT = Path(__file__).resolve().parent.parent
 RUNNER = TOOL_ROOT / "run_review.py"
@@ -127,6 +127,25 @@ def main() -> int:
         passthrough(pause_notes[0])
 
     state = common.load_state(project)
+
+    # 手動觸發的審查跑完只留一張收據，不直接改 state.json——hook 也在寫
+    # 同一個檔案，兩個行程互相覆蓋。收據在這裡兌現（單一寫入者仍是 hook）。
+    receipt = common.read_json(common.review_dir(project) / dispatch.RECEIPT)
+    if (isinstance(receipt, dict)
+            and int(receipt.get("round") or 0) > int(state.get("receipt_round") or 0)):
+        state["watermark"] = float(receipt.get("watermark")
+                                   or state.get("watermark", 0.0))
+        state["head_sha"] = receipt.get("head_sha") or state.get("head_sha", "")
+        state["round"] = max(int(state.get("round", 0)),
+                             int(receipt.get("round") or 0))
+        state["reported_deletions"] = sorted(
+            set(state.get("reported_deletions") or [])
+            | set(receipt.get("deleted") or []))
+        if receipt.get("transcript") == transcript_path:
+            # 換過 session 的話，收據裡的行號指的是另一份逐字稿，不能套用。
+            state["cursor"] = int(receipt.get("end_line") or state.get("cursor", 0))
+        state["receipt_round"] = int(receipt.get("round") or 0)
+        common.save_state(project, state)
     if state.get("transcript") != transcript_path:
         # 新的 session：游標從頭算起。
         stale = state.get("pending")
@@ -212,9 +231,8 @@ def main() -> int:
             watermark = Path(transcript_path).stat().st_ctime
         except OSError:
             watermark = time.time() - 900
-    parsed = tx.parse(Path(transcript_path), state.get("cursor", 0))
-    end_line = parsed.get("end_line", state.get("cursor", 0))
-    files, deleted, _source = tx.changed_code_files(project, parsed, since=watermark)
+    parsed, end_line, files, deleted = dispatch.detect(
+        project, transcript_path, state.get("cursor", 0), watermark)
 
     # 刪除沒有 mtime 可比，而 git status 會一直列出它直到 commit。
     # 只報告沒報告過的那些，否則就變成當初那個反覆攔阻的 bug。
@@ -229,41 +247,33 @@ def main() -> int:
         common.save_state(project, state)
         return 0  # 沒改程式碼：完全靜默，零成本（第 2 題的閘門）
 
+    # ---- 手動／門檻模式的閘門 ----
+    # 每一輪都審，在小修時完全不划算：實測一次約 11 萬 tokens、170～650 秒。
+    # manual 永不自動送；threshold 只在累積量大到可能漏掉時才自動送一次。
+    trigger = str(cfg.get("trigger") or "auto").lower()
+    if trigger not in common.TRIGGERS:
+        trigger = "auto"
+    auto_reason = ""
+    if trigger != "auto":
+        if trigger == "threshold":
+            auto_reason = dispatch.over_threshold(
+                cfg, project, files, fresh_deletions, state.get("head_sha") or "")
+        if not auto_reason:
+            # 不派工就什麼都不推進——水位線、游標、head_sha、reported_deletions
+            # 全部維持原樣，這批改動於是留在累積裡，下一輪繼續被看見。
+            common.save_state(project, state)
+            passthrough(dispatch.backlog_note(files, fresh_deletions))
+
     state["reported_deletions"] = sorted(reported | set(fresh_deletions))
 
     # ---- 建工作單並攔阻 ----
-    round_no = int(state.get("round", 0)) + 1
+    round_no = dispatch.next_round(project, state)
     now = time.time()
     head_now = tx.git_head(project)
-    job_path = rdir / ("job-" + str(round_no) + ".json")
-    fingerprints = {}
-    for path in files:
-        try:
-            st = Path(path).stat()
-            fingerprints[path] = [round(st.st_mtime, 3), st.st_size]
-        except OSError:
-            pass
-    common.write_json(job_path, {
-        "round": round_no,
-        "project": str(project),
-        "transcript": transcript_path,
-        "start_line": state.get("cursor", 0),
-        "end_line": end_line,
-        "since": watermark,
-        # 這一輪的起點是「**上一次** Stop 當下的 HEAD」，不是現在的 HEAD。
-        # hook 在回合結束時才跑，那時執行者可能已經把這一輪 commit 掉了，
-        # 拿當下的 HEAD 當基準，diff 只會剩下 commit 之後的零星改動——
-        # 等於沒修好。（第一版就是這樣，實測 diff 只涵蓋 5 個檔案裡的 2 個。）
-        "base_sha": state.get("head_sha") or head_now,
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "files": files,
-        "deleted": fresh_deletions,
-        # 每個檔案在派工當下的指紋。背景審查跑那 150～650 秒裡，
-        # 執行者可能又改了同一個檔案，審查於是讀到下一回合的內容卻宣稱
-        # 自己審的是這一回合。完整快照太貴（每輪多寫一份專案副本），
-        # 但指紋很便宜，而且足以讓審查者知道自己看的東西已經變過。
-        "fingerprints": fingerprints,
-    })
+    job_path = dispatch.create_job(
+        project, round_no, transcript_path, state.get("cursor", 0), end_line,
+        watermark, files, fresh_deletions,
+        base_sha=state.get("head_sha") or head_now)
 
     # 這一次的 HEAD 就是下一輪的起點。
     state["head_sha"] = head_now
@@ -282,6 +292,9 @@ def main() -> int:
     common.save_state(project, state)
 
     reason = build_reason(job_path, files + fresh_deletions, project, modes)
+    if auto_reason:
+        reason = ("cross-review：" + auto_reason + "，已超過自動送審門檻。"
+                  + "（要改成完全手動就用 /cross-review manual）\n\n") + reason
     if pause_notes:
         # 部分暫停：還是要派工，但不能讓「有一種審查停著」這件事消失。
         reason = pause_notes[0] + "\n\n" + reason
