@@ -21,6 +21,8 @@ if __name__ == "__main__":
             pass
         rest = list(sys.argv[2:])
         only = None
+        force = "--force" in rest
+        rest = [a for a in rest if a != "--force"]
         # 手寫解析要自己驗：`--now PROJECT --mode`（少了值）原本會安靜地退回
         # 跑全部模式，等於使用者以為只跑視覺、實際上連程式碼審查也送出去了。
         while "--mode" in rest:
@@ -41,7 +43,7 @@ if __name__ == "__main__":
             print("多餘的參數：" + "、".join(rest[1:]))
             sys.exit(2)
         target = Path(rest[0]) if rest else Path.cwd()
-        sys.exit(run_now(target, only))
+        sys.exit(run_now(target, only, force))
 
     # `--trigger auto|manual|threshold [專案路徑]` 改這個專案的觸發模式。
     if len(sys.argv) > 2 and sys.argv[1] == "--trigger":

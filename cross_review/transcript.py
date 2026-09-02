@@ -91,6 +91,60 @@ def _shorten_reference(text: str) -> str:
             + encoded[-_REFERENCE_MAX_BYTES:].decode("utf-8", "ignore"))
 
 
+# 使用者要求審查的說法。工具用它來擋「執行者自己決定送審」。
+#
+# 為什麼判準是使用者的原話：執行者控制得了命令列、控制得了設定檔，唯一偽造
+# 不了的是逐字稿裡使用者說過什麼。實測過一次——hook 的訊息已經寫成
+# 「執行者不要自己送審」，那個 session 讀到了，還是在使用者說「全修」之後
+# 自己送了下一輪。文字訊息攔不住一個已經決定好流程的執行者。
+#
+# 這裡刻意寫寬（「跑一下」「看一下」都算）：擋錯的代價是使用者要再講一次，
+# 漏擋的代價是程式碼在沒人點頭的情況下送出去。
+_REVIEW_REQUEST = re.compile(
+    "審查|送審|審一下|給 ?codex|交叉審|cross.?review"
+    "|跑一下|跑一次|跑個|看一下|檢查一下|驗一下"
+    "|review|check this", re.I)
+
+
+def last_user_text(transcript_path: Path) -> str:
+    """逐字稿裡最後一則真正由使用者說的話。找不到就回空字串。
+
+    從尾巴往回找，跳過 harness 的通知與 tool_result。
+    """
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if obj.get("type") != "user" or obj.get("isMeta"):
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content):
+            continue          # 工具回傳，不是使用者說的話
+        raw_text = _text_of(obj.get("message") or {})
+        if is_harness_noise(raw_text):
+            continue
+        text = _clean_user_text(raw_text)
+        if text:
+            return text
+    return ""
+
+
+def asked_for_review(transcript_path: Path) -> bool:
+    """使用者最近那句話有沒有要求審查。"""
+    return bool(_REVIEW_REQUEST.search(last_user_text(transcript_path)))
+
+
 def _assistant_text_before(transcript_path: Path, start_line: int) -> str:
     """游標之前最近的一則助手回覆。
 

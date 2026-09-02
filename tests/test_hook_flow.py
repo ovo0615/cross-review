@@ -1345,6 +1345,50 @@ def scenario_trigger_modes(base: Path) -> None:
 
 
 
+def scenario_manual_gate(base: Path) -> None:
+    """manual 模式下，執行者不能自己送審。
+
+    hook 的提示已經寫成「執行者不要自己送審」，實測攔不住：一個 session 讀到了
+    那句話，在使用者說「全修」之後照樣送出下一輪。文字訊息對執行者只是建議，
+    唯一有牙齒的是它偽造不了的資料——逐字稿裡使用者說過什麼。
+    """
+    from cross_review import common as _cm, review as _rv, transcript as _tx
+    proj = base / "gateproj"
+    (proj / "src").mkdir(parents=True)
+    (proj / ".claude" / "review").mkdir(parents=True)
+    (proj / "src" / "a.py").write_text("a = 1", encoding="utf-8")
+    t = base / "gate.jsonl"
+
+    def say(word):
+        t.write_text(json.dumps(
+            {"type": "user", "message": {"role": "user", "content": word}},
+            ensure_ascii=False), encoding="utf-8")
+        _cm.save_state(proj, {"transcript": str(t), "cursor": 0,
+                              "watermark": 1.0, "round": 0})
+
+    for word in ("全修", "繼續", "都改好了嗎", "下一步", "commit 一下"):
+        say(word)
+        check("使用者說「" + word + "」時擋下自行送審", _rv.run_now(proj) == 2)
+
+    # 使用者真的開口了就要放行。這裡只驗閘門——真的呼叫 run_now 會去跑 Codex。
+    for word in ("審查", "送審", "跑一下", "幫我看一下", "review this"):
+        say(word)
+        check("使用者說「" + word + "」時放行", _tx.asked_for_review(t))
+
+    # 逐字稿裡最後一則要是**使用者**說的，不能撈到工具回傳或 harness 通知。
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": "審查"}},
+        {"type": "assistant", "message": {"role": "assistant",
+                                          "content": [{"type": "text", "text": "好"}]}},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "x", "content": "審查完成"}]}},
+    ]
+    t.write_text("\n".join(
+        json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+    check("工具回傳不會被當成使用者發言",
+          _tx.last_user_text(t) == "審查", _tx.last_user_text(t))
+
+
 def scenario_user_consent(base: Path) -> None:
     """使用者層級的授權檔案。
 
@@ -2041,6 +2085,7 @@ def main() -> int:
         scenario_cdp_events(base)
         scenario_trigger_modes(base)
         scenario_user_consent(base)
+        scenario_manual_gate(base)
         scenario_receipt(base)
         scenario_other_agents_directories(base)
         scenario_referenced_context(base)

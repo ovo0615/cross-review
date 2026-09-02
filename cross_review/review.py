@@ -896,7 +896,7 @@ if __name__ == "__main__":
     sys.exit(main())
 
 
-def run_now(project: Path, only: str = None) -> int:
+def run_now(project: Path, only: str = None, force: bool = False) -> int:
     """使用者手動觸發：把累積至今的改動組成一份工作單，當場審完。
 
     `only` 可以限定只跑 "code" 或 "visual"。
@@ -919,6 +919,28 @@ def run_now(project: Path, only: str = None) -> int:
             watermark = Path(transcript_path).stat().st_ctime
         except OSError:
             watermark = 0.0
+
+    # ---- manual 模式：使用者沒開口就不送 ----
+    #
+    # hook 的提示已經寫成「執行者不要自己送審」，實測仍然攔不住：一個 session
+    # 讀到了那句話，在使用者說「全修」之後照樣送出下一輪——它已經在自己決定
+    # 好的「修完就送審」迴圈裡了。文字訊息對執行者只是建議。
+    #
+    # 唯一有牙齒的是執行者偽造不了的資料：逐字稿裡使用者說過什麼。
+    if (common.effective_trigger(project, cfg) == "manual"
+            and transcript_path and not force):
+        if not tx.asked_for_review(Path(transcript_path)):
+            said = tx.last_user_text(Path(transcript_path)).replace("\n", " ")[:60]
+            print("這個專案是 manual 模式，而使用者最近那句話沒有要求審查，所以不送。")
+            print("  使用者最後說的是：「" + (said or "（讀不到）") + "」")
+            print("  要送審，請使用者說「審查」。")
+            print("  若確實是使用者要求的而這裡誤判了，加 --force"
+                  "（會記進 errors.log，讓使用者看得到）。")
+            return 2
+    if force and common.effective_trigger(project, cfg) == "manual":
+        common.log_error(project, "manual 模式下以 --force 略過「使用者是否要求審查」"
+                                  "的檢查。使用者最後說的是：「"
+                         + tx.last_user_text(Path(transcript_path))[:80] + "」")
 
     scan_started = time.time()      # 必須在偵測之前取，理由見 create_job
     _parsed, end_line, files, deleted = dispatch.detect(
