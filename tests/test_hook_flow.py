@@ -56,16 +56,40 @@ def touch(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+# 測試專用的使用者層級設定檔。指到這裡，測試才能驗「專案自己設不了 auto」
+# 而不必去動使用者真實的 %USERPROFILE%\.claude\cross-review.json。
+USER_SETTINGS = None
+
+
 def force_auto(project: Path) -> None:
     """把專案釘成 auto 觸發。
 
-    預設是 threshold（小改不送審），所以驗「有改動就攔阻」的情境必須
-    自己明講要 auto，否則測的其實是門檻沒跨過——那種綠燈什麼都沒證明。
+    預設是 manual（不送審），所以驗「有改動就攔阻」的情境必須自己明講要
+    auto，否則測的其實是「預設不送」——那種綠燈什麼都沒證明。
+
+    授權寫在**使用者層級**：專案設定放不寬，只寫 config.json 是沒有用的。
     """
     rdir = project / ".claude" / "review"
     rdir.mkdir(parents=True, exist_ok=True)
     (rdir / "config.json").write_text(
         json.dumps({"trigger": "auto"}, ensure_ascii=False), encoding="utf-8")
+    grant(project, "auto")
+
+
+def grant(project: Path, mode: str) -> None:
+    """在測試用的使用者層級檔案裡授予這個專案某個觸發模式。"""
+    data = {}
+    if USER_SETTINGS and USER_SETTINGS.exists():
+        try:
+            data = json.loads(USER_SETTINGS.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    table = data.setdefault("triggers", {})
+    table[str(Path(project).resolve())] = mode
+    USER_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    USER_SETTINGS.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
 def run_hook(project: Path, transcript: Path):
@@ -75,11 +99,15 @@ def run_hook(project: Path, transcript: Path):
         "hook_event_name": "Stop",
         "stop_hook_active": False,
     })
+    env = dict(os.environ)
+    if USER_SETTINGS:
+        env["CROSS_REVIEW_SETTINGS"] = str(USER_SETTINGS)
     proc = subprocess.run(
         [sys.executable, str(RUN_HOOK)],
         input=payload.encode("utf-8"),
         capture_output=True,
         timeout=120,
+        env=env,
     )
     out = proc.stdout.decode("utf-8", "replace").strip()
     parsed = None
@@ -1272,9 +1300,17 @@ def scenario_trigger_modes(base: Path) -> None:
           after.get("round") == before.get("round"),
           (before.get("round"), after.get("round")))
 
-    # 門檻：把門檻壓到 2，同一批累積就該自動送一次。
+    # 專案自己寫 threshold 是**沒有用**的：授權住在使用者層級，
+    # 否則 clone 回來的版本庫可以自帶一份 config.json 把自己設成 auto。
     cfg_path.write_text(json.dumps({"trigger": "threshold", "auto_when_files": 2}),
                         encoding="utf-8")
+    touch(proj / "src" / "d.py", "d = 1")
+    out, _ = run_hook(proj, t)
+    check("專案自己設 threshold 不會生效",
+          "decision" not in (out or {}), out)
+
+    # 使用者層級授予之後才會生效。
+    grant(proj, "threshold")
     touch(proj / "src" / "a.py", "a = 3")
     out, _ = run_hook(proj, t)
     check("超過門檻會自動送審", (out or {}).get("decision") == "block", out)
@@ -1901,7 +1937,12 @@ def scenario_breaker_and_usage(base: Path) -> None:
 
 
 def main() -> int:
+    global USER_SETTINGS
     base = Path(tempfile.mkdtemp(prefix="crossreview_test_"))
+    # 整批測試共用一份使用者層級設定，指到暫存目錄裡——絕對不要碰
+    # 使用者真實的 %USERPROFILE%\.claude\cross-review.json。
+    USER_SETTINGS = base / "user-cross-review.json"
+    os.environ["CROSS_REVIEW_SETTINGS"] = str(USER_SETTINGS)
     try:
         scenario_non_git(base)
         scenario_git(base)

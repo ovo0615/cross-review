@@ -19,12 +19,27 @@ if __name__ == "__main__":
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
-        rest = [a for a in sys.argv[2:]]
+        rest = list(sys.argv[2:])
         only = None
-        if "--mode" in rest:
+        # 手寫解析要自己驗：`--now PROJECT --mode`（少了值）原本會安靜地退回
+        # 跑全部模式，等於使用者以為只跑視覺、實際上連程式碼審查也送出去了。
+        while "--mode" in rest:
             i = rest.index("--mode")
-            only = rest[i + 1] if len(rest) > i + 1 else None
+            value = rest[i + 1] if len(rest) > i + 1 else None
+            if not value or value.startswith("-"):
+                print("--mode 後面要接 code 或 visual。")
+                sys.exit(2)
+            if only and only != value:
+                print("--mode 只能指定一次（收到 " + only + " 與 " + value + "）。")
+                sys.exit(2)
+            if value not in ("code", "visual"):
+                print("--mode 只能是 code 或 visual，收到：" + value)
+                sys.exit(2)
+            only = value
             del rest[i:i + 2]
+        if len(rest) > 1:
+            print("多餘的參數：" + "、".join(rest[1:]))
+            sys.exit(2)
         target = Path(rest[0]) if rest else Path.cwd()
         sys.exit(run_now(target, only))
 

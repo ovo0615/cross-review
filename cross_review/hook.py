@@ -254,9 +254,9 @@ def main() -> int:
     # ---- 手動／門檻模式的閘門 ----
     # 每一輪都審，在小修時完全不划算：實測一次約 11 萬 tokens、170～650 秒。
     # manual 永不自動送；threshold 只在累積量大到可能漏掉時才自動送一次。
-    trigger = str(cfg.get("trigger") or "auto").lower()
-    if trigger not in common.TRIGGERS:
-        trigger = "auto"
+    # 生效值＝使用者授予的與專案要求的取較嚴格者。專案設定放不寬——
+    # clone 回來的版本庫不能靠自帶一份 config.json 就把自己設成 auto。
+    trigger = common.effective_trigger(project, cfg)
     auto_reason = ""
     if trigger != "auto":
         if trigger == "threshold":

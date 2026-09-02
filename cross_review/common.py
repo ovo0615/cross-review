@@ -329,6 +329,16 @@ SECURITY_KEYS = {"allow_remote_urls", "allow_file_urls", "disable_codex_plugins"
 
 
 def user_settings_path() -> Path:
+    """使用者層級的設定檔。安全邊界與觸發授權都住在這裡。
+
+    CROSS_REVIEW_SETTINGS 可以改指到別的檔案。這是給測試用的——否則要驗
+    「專案不能自己解除 manual」就得去動使用者真實的檔案。它不構成弱點：
+    能設環境變數的人已經有這台機器上的執行權限了，而威脅模型針對的是
+    「clone 回來的版本庫自帶一份 config.json」，那種檔案設不了環境變數。
+    """
+    override = os.environ.get("CROSS_REVIEW_SETTINGS")
+    if override:
+        return Path(override)
     return Path.home() / ".claude" / "cross-review.json"
 
 
@@ -355,6 +365,67 @@ def load_config(project: Path) -> dict:
         given = []
     cfg["disable_codex_plugins"] = sorted(forced | {str(x) for x in given})
     return cfg
+
+
+# 由寬到嚴：專案設定只能往「嚴」的方向走。
+_TRIGGER_RANK = {"manual": 0, "threshold": 1, "auto": 2}
+
+
+def granted_trigger(project: Path) -> str:
+    """使用者在**使用者層級**授予這個專案的觸發模式。沒有紀錄就是 manual。
+
+    為什麼不放在專案設定裡：把預設改成 manual 之後，同意送出這件事就是
+    整個工具唯一的安全邊界；而任何專案的 .claude/review/config.json 都能
+    自己寫 trigger=auto——包括從別處 clone 回來、版本庫裡本來就帶著這個
+    檔案的專案。配上全域 hook，那條路徑是「clone 一個陌生的 repo → 開
+    session → 它的程式碼自動送去 Codex，使用者完全沒有點過頭」。
+
+    這跟 disable_codex_plugins 是同一個道理：預設拒絕如果可以被對方打開，
+    那就不是邊界。授權必須住在一個 repo 碰不到的地方。
+    """
+    data = read_json(user_settings_path())
+    if not isinstance(data, dict):
+        return "manual"
+    table = data.get("triggers")
+    if not isinstance(table, dict):
+        return "manual"
+    try:
+        key = str(Path(project).resolve())
+    except OSError:
+        return "manual"
+    for stored, mode in table.items():
+        try:
+            same = str(Path(str(stored)).resolve()) == key
+        except OSError:
+            same = str(stored) == key
+        if same and str(mode).lower() in _TRIGGER_RANK:
+            return str(mode).lower()
+    return "manual"
+
+
+def grant_trigger(project: Path, mode: str) -> None:
+    """把授權寫進使用者層級的檔案。這是 --trigger 唯一該寫的地方。"""
+    data = read_json(user_settings_path())
+    if not isinstance(data, dict):
+        data = {}
+    table = data.get("triggers")
+    if not isinstance(table, dict):
+        table = {}
+    table[str(Path(project).resolve())] = str(mode).lower()
+    data["triggers"] = table
+    write_json(user_settings_path(), data)
+
+
+def effective_trigger(project: Path, cfg: dict) -> str:
+    """實際生效的觸發模式：使用者授予的與專案要求的，取比較嚴格的那個。
+
+    專案設定可以把自己收得更緊（寫 manual），但放不寬。
+    """
+    granted = granted_trigger(project)
+    asked = str(cfg.get("trigger") or "manual").lower()
+    if asked not in _TRIGGER_RANK:
+        asked = "manual"
+    return asked if _TRIGGER_RANK[asked] < _TRIGGER_RANK[granted] else granted
 
 
 def positive_int(cfg: dict, key: str, minimum: int = 1) -> int:

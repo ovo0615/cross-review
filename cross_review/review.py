@@ -927,11 +927,12 @@ def run_now(project: Path, only: str = None) -> int:
     reported = {p for p in (state.get("reported_deletions") or [])
                 if not Path(p).exists()}
     deletions = [p for p in deleted if p not in reported]
-    modes = []
+    enabled = []
     if cfg.get("visual_review", True) and cfg.get("shots"):
-        modes.append("visual")          # 快的排前面（ADR-0003）
+        enabled.append("visual")        # 快的排前面（ADR-0003）
     if cfg.get("code_review", True):
-        modes.append("code")
+        enabled.append("code")
+    modes = list(enabled)
     if only:
         modes = [m for m in modes if m == only]
         if not modes:
@@ -942,6 +943,8 @@ def run_now(project: Path, only: str = None) -> int:
         # 視覺審查**不需要**程式碼改動：使用者想看的是畫面，跟這一輪有沒有
         # 改到檔案無關。原本這裡直接回傳，於是「我只想看一眼畫面」做不到——
         # 而那正是這個工具最初要解決的事（不必再自己截圖給人看）。
+        # 沒有程式碼改動時，程式碼審查本來就沒東西可看，不算漏審。
+        enabled = [m for m in enabled if m == "visual"]
         modes = [m for m in modes if m == "visual"]
         if not modes:
             print("沒有累積的改動，也沒有設定要看的畫面，這一次不用審查。")
@@ -974,10 +977,13 @@ def run_now(project: Path, only: str = None) -> int:
     # （或被斷路器暫停）時照樣寫收據，水位線往前推，失敗的那批程式碼
     # 再也不會被重審——而使用者看到的是「審過了」。
     done = [m for m in modes if job_path.with_suffix("." + m + ".done").exists()]
-    if dispatch.all_modes_done(job_path, modes):
+    # 要看**所有啟用的模式**，不是 --mode 篩過的那幾個。只看篩過的話，
+    # `--mode visual` 在有程式碼改動時會因為視覺跑完就寫收據，下一次 hook
+    # 推進水位線，那批還沒被程式碼審查看過的改動就靜默消失了。
+    if dispatch.all_modes_done(job_path, enabled):
         dispatch.write_receipt(project, job, head_now)
     elif done:
-        missing = [m for m in modes if m not in done]
+        missing = [m for m in enabled if m not in done]
         print("⚠️ 只有 " + "、".join(done) + " 跑完，"
               + "、".join(missing) + " 沒有結果，這批改動留在累積裡不會推進。")
     return worst
@@ -992,9 +998,10 @@ def set_trigger(project: Path, mode: str) -> int:
     if not common.review_dir_is_safe(project):
         print("⚠️ " + str(common.review_dir(project)) + " 指向專案外部，拒絕動作。")
         return 1
-    cfg = common.ensure_config(project)
-    cfg["trigger"] = mode
-    common.write_json(common.review_dir(project) / "config.json", cfg)
+    common.ensure_config(project)
+    # 寫在使用者層級，不是專案設定：授權必須住在一個 repo 碰不到的地方。
+    common.grant_trigger(project, mode)
+    cfg = common.load_config(project)
     explain = {
         "auto": "有改動就攔阻，非審不可。",
         "manual": "永不自動送審，只報累積量，你說了才送。",
