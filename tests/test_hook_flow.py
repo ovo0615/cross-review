@@ -1363,6 +1363,57 @@ def scenario_receipt(base: Path) -> None:
           json.loads(jp5.read_text(encoding="utf-8"))["dispatched"] == 12345.0)
 
 
+def scenario_other_agents_directories(base: Path) -> None:
+    """同一個工作目錄裡有第二個代理人時，它的檔案不該被算成我這一輪的工作。
+
+    真的發生過：另一個代理人在專案裡開了一個 git worktree，那一輪就掃出
+    25 個待審檔案，其中 17 個在它的暫存 worktree 裡、其餘在它負責的目錄。
+    水位線只看 mtime，分不出是誰改的。
+    """
+    from cross_review import transcript as tx, dispatch
+    proj = base / "twoagents"
+    (proj / "mine").mkdir(parents=True)
+    (proj / "theirs").mkdir()
+    (proj / "wt" / "inner").mkdir(parents=True)
+    (proj / "mine" / "a.py").write_text("a = 1", encoding="utf-8")
+    (proj / "theirs" / "b.py").write_text("b = 1", encoding="utf-8")
+    (proj / "wt" / "inner" / "c.py").write_text("c = 1", encoding="utf-8")
+
+    # worktree 的 .git 是**檔案**，版本庫的是目錄；兩者都要擋。
+    (proj / "wt" / ".git").write_text("gitdir: /somewhere/else", encoding="utf-8")
+
+    found = tx.walk_code_files(proj, since=0.0)
+    names = sorted(Path(f).name for f in found)
+    check("巢狀 worktree 底下的檔案不會被掃到",
+          "c.py" not in names, names)
+    check("同層的其他檔案照常掃得到",
+          "a.py" in names and "b.py" in names, names)
+
+    # 巢狀版本庫（.git 是目錄）也一樣。
+    (proj / "repo").mkdir()
+    (proj / "repo" / ".git").mkdir()
+    (proj / "repo" / "d.py").write_text("d = 1", encoding="utf-8")
+    check("巢狀版本庫底下的檔案也不會被掃到",
+          "d.py" not in [Path(f).name for f in tx.walk_code_files(proj, since=0.0)],
+          [Path(f).name for f in tx.walk_code_files(proj, since=0.0)])
+
+    # 同一個版本庫裡由別人負責的目錄，靠設定排除。
+    # 水位線要非零：changed_code_files() 在 since=0 時刻意不走目錄掃描，
+    # 否則會把整個專案都當成本回合的改動。
+    _p, _e, files, _d = dispatch.detect(proj, "", 0, 1.0, ignore=["theirs"])
+    kept = sorted(Path(f).name for f in files)
+    check("ignore_paths 列出的目錄會被排除", "b.py" not in kept, kept)
+    check("ignore_paths 不會誤傷我自己的檔案", "a.py" in kept, kept)
+
+    # 前綴比對必須以路徑分段為單位，不能只比字串開頭。
+    (proj / "theirs_mine").mkdir()
+    (proj / "theirs_mine" / "e.py").write_text("e = 1", encoding="utf-8")
+    _p, _e2, files2, _d2 = dispatch.detect(proj, "", 0, 1.0, ignore=["theirs"])
+    check("名稱只是開頭相同的目錄不會被誤排除",
+          "e.py" in [Path(f).name for f in files2],
+          sorted(Path(f).name for f in files2))
+
+
 def scenario_referenced_context(base: Path) -> None:
     """使用者說「依照你的建議」時，那個建議本文要進材料包。
 
@@ -1841,6 +1892,7 @@ def main() -> int:
         scenario_cdp_events(base)
         scenario_trigger_modes(base)
         scenario_receipt(base)
+        scenario_other_agents_directories(base)
         scenario_referenced_context(base)
         scenario_breaker_and_usage(base)
     finally:

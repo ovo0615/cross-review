@@ -235,7 +235,8 @@ def main() -> int:
     # 用掃描之後的時刻當水位線會把它們算成已審，之後再也偵測不到。
     scan_started = time.time()
     parsed, end_line, files, deleted = dispatch.detect(
-        project, transcript_path, state.get("cursor", 0), watermark)
+        project, transcript_path, state.get("cursor", 0), watermark,
+        ignore=cfg.get("ignore_paths"))
 
     # 刪除沒有 mtime 可比，而 git status 會一直列出它直到 commit。
     # 只報告沒報告過的那些，否則就變成當初那個反覆攔阻的 bug。

@@ -257,6 +257,12 @@ DEFAULT_CONFIG = {
     "code_review": True,
     "visual_review": True,
     "trigger": "threshold",
+    # 這個專案裡不屬於「我」的目錄（相對專案根目錄）。水位線只看 mtime，
+    # 分不出是誰改的：同一個工作目錄裡有第二個代理人時，它的改動會被算成
+    # 本回合的工作而送去審查——白燒額度，也等於把別人未完成的東西交出去。
+    # 巢狀的版本庫／worktree 已經自動排除，這裡處理的是同一個版本庫裡
+    # 由別人負責的目錄。
+    "ignore_paths": [],
     "auto_when_files": 10,
     "auto_when_diff_bytes": 20_480,   # 20 KB
     # 材料包上限（第 14 題）。超過就截斷，並在報告開頭強制標明。

@@ -920,7 +920,8 @@ def run_now(project: Path) -> int:
 
     scan_started = time.time()      # 必須在偵測之前取，理由見 create_job
     _parsed, end_line, files, deleted = dispatch.detect(
-        project, transcript_path, int(state.get("cursor", 0)), watermark)
+        project, transcript_path, int(state.get("cursor", 0)), watermark,
+        ignore=cfg.get("ignore_paths"))
     reported = {p for p in (state.get("reported_deletions") or [])
                 if not Path(p).exists()}
     deletions = [p for p in deleted if p not in reported]

@@ -18,12 +18,35 @@ from . import common, transcript as tx
 RECEIPT = "reviewed.json"
 
 
-def detect(project: Path, transcript_path: str, cursor: int, watermark: float):
-    """這一輪（或累積至今）改到了什麼。回傳 (parsed, end_line, files, deleted)。"""
+def detect(project: Path, transcript_path: str, cursor: int, watermark: float,
+           ignore=None):
+    """這一輪（或累積至今）改到了什麼。回傳 (parsed, end_line, files, deleted)。
+
+    `ignore` 是專案設定裡的 ignore_paths：同一個工作目錄裡有第二個代理人時，
+    它負責的目錄不該被算成我這一輪的工作。
+    """
     parsed = tx.parse(Path(transcript_path), cursor) if transcript_path else {}
     end_line = parsed.get("end_line", cursor)
     files, deleted, _source = tx.changed_code_files(project, parsed, since=watermark)
+    if ignore:
+        keep = lambda p: not _under_any(project, p, ignore)
+        files = [f for f in files if keep(f)]
+        deleted = [d for d in deleted if keep(d)]
     return parsed, end_line, files, deleted
+
+
+def _under_any(project: Path, path, prefixes) -> bool:
+    """path 是否落在 prefixes 列出的任何一個目錄底下。"""
+    try:
+        rel = Path(path).resolve().relative_to(Path(project).resolve())
+    except (ValueError, OSError):
+        return False
+    parts = rel.parts
+    for prefix in prefixes:
+        want = Path(str(prefix).replace("\\", "/")).parts
+        if want and parts[:len(want)] == want:
+            return True
+    return False
 
 
 def next_round(project: Path, state: dict) -> int:

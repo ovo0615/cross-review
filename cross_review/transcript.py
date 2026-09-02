@@ -422,6 +422,13 @@ def walk_code_files(project: Path, since: float) -> list:
             d for d in dirnames
             if d not in common.IGNORED_PARTS
             and (not d.startswith(".") or d in common.ALLOWED_DOT_DIRS)
+            # 底下自己帶著 .git 的目錄是另一個版本庫或另一個 worktree，
+            # 不屬於這個專案的工作範圍。實際踩到：另一個代理人在專案裡開了
+            # 一個 worktree，這一輪就掃出 17 個不是我改的檔案要送審——
+            # 既白燒額度，也等於把別人未完成的工作交出去。
+            # 判準用「有沒有 .git」而不是目錄名稱：worktree 的 .git 是檔案，
+            # 版本庫的是目錄，兩者 exists() 都成立。
+            and not os.path.exists(os.path.join(dirpath, d, ".git"))
         ]
         for name in filenames:
             if os.path.splitext(name)[1].lower() not in common.CODE_SUFFIXES:
