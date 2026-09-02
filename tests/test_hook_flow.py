@@ -1721,8 +1721,13 @@ def scenario_breaker_and_usage(base: Path) -> None:
     for q in procs:
         q.wait()
     events = breaker._events(proj12, "code")
-    check("併行寫入不會遺失任何事件",
-          len(events) == 4, [e.get("ok") for e in events])
+    # 要驗的是「失敗一筆都不會掉」。不能驗總數等於 4：record_success() 在
+    # 沒有累積失敗時**刻意不寫入**（那一筆不帶資訊），所以成功的行程若剛好
+    # 排在所有失敗之前，就只會有 3 筆。這條原本寫成 == 4，於是大約每五次
+    # 失敗一次——而症狀看起來像「追加會掉資料」，跟事實相反。
+    failures = [e for e in events if not e.get("ok")]
+    check("併行寫入不會遺失任何失敗事件",
+          len(failures) == 3, [e.get("ok") for e in events])
     check("每一行都是完整的 JSON",
           all(isinstance(e, dict) and "t" in e for e in events), events)
 
