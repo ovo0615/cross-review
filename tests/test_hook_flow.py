@@ -1097,35 +1097,41 @@ def scenario_cdp_events(base: Path) -> None:
           "讀了 %d 次，預期 4 次（enable／lifecycle／事件／navigate）" % b.ws.recv_calls)
 
     # --- 上一頁的停止事件在清空「之後」抵達，不能被當成這一次完成 ---
-    # 這是只清空佇列擋不住的那一半。
-    b = make({"Page.navigate": NAV},
-             [("Page.navigate", {"method": "Page.frameStoppedLoading",
-                                 "params": {"frameId": "F-OLD"}})])
-    b.goto("http://localhost:1/", settle_ms=0)
-    check("別的 frame 的停止事件不會被當成這一次導航完成",
-          b.ws.recv_calls > 4,
-          "只讀了 %d 次，代表拿舊事件充數" % b.ws.recv_calls)
-
-    # --- 同一個 frame 的停止事件才算數 ---
+    # 關鍵：主 frame 在前後頁導航時**是同一個 frameId**，所以這裡刻意用
+    # 跟本次導航相同的 F-NEW。先前的測試用 F-OLD 對 F-NEW，
+    # 等於假設前後導航會有不同 frameId——那個假設本身就是錯的，
+    # 於是測試通過了，而真正會發生的情境完全沒被覆蓋。
     b = make({"Page.navigate": NAV},
              [("Page.navigate", {"method": "Page.frameStoppedLoading",
                                  "params": {"frameId": "F-NEW"}})])
     b.goto("http://localhost:1/", settle_ms=0)
-    check("同一個 frame 的停止事件算數", b.ws.recv_calls == 4, str(b.ws.recv_calls))
+    check("同一個主 frame 的舊停止事件不會被當成這一次導航完成",
+          b.ws.recv_calls > 4,
+          "只讀了 %d 次，代表拿 frameId 相符的舊事件充數" % b.ws.recv_calls)
 
-    # --- 拿不到 loaderId／frameId 時才退回採信 loadEventFired ---
-    b = make({"Page.navigate": {}},
-             [("Page.navigate", {"method": "Page.loadEventFired"})])
+    # --- 別人的 loaderId 也不算數 ---
+    b = make({"Page.navigate": NAV},
+             [("Page.navigate", {"method": "Page.lifecycleEvent",
+                                 "params": {"name": "load", "loaderId": "L-OLD"}})])
     b.goto("http://localhost:1/", settle_ms=0)
-    check("沒有識別可關聯時才採信 loadEventFired",
-          b.ws.recv_calls == 4, str(b.ws.recv_calls))
+    check("別次導航的 loaderId 不算數", b.ws.recv_calls > 4, str(b.ws.recv_calls))
 
+    # --- 有 loaderId 時，不帶識別的事件一律不採信 ---
     b = make({"Page.navigate": NAV},
              [("Page.navigate", {"method": "Page.loadEventFired"})])
     b.goto("http://localhost:1/", settle_ms=0)
-    check("有識別可關聯時就不採信沒帶識別的 loadEventFired",
+    check("有 loaderId 時不採信沒帶識別的 loadEventFired",
           b.ws.recv_calls > 4,
           "只讀了 %d 次，代表用了關聯不上的事件" % b.ws.recv_calls)
+
+    # --- 完全拿不到 loaderId 時才降級 ---
+    for method, params in (("Page.loadEventFired", {}),
+                           ("Page.frameStoppedLoading", {"frameId": "F-ANY"})):
+        b = make({"Page.navigate": {}},
+                 [("Page.navigate", {"method": method, "params": params})])
+        b.goto("http://localhost:1/", settle_ms=0)
+        check("沒有 loaderId 時才降級採信 " + method,
+              b.ws.recv_calls == 4, str(b.ws.recv_calls))
 
     # --- navigate 之前要清掉上一頁殘留的事件 ---
     b = make({"Page.navigate": NAV})

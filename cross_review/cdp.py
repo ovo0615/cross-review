@@ -354,22 +354,35 @@ class Browser:
         只清空佇列是不夠的：上一頁的停止事件若在清空之後、navigate 回應
         之前才抵達，一樣會被誤認成新頁載入完成，然後拍到還沒載入完的畫面。
 
-        關聯的方式看事件本身帶不帶識別：
-          - Page.lifecycleEvent 帶 loaderId，可以精確關聯（要先 enable）
-          - Page.frameStoppedLoading 帶 frameId，可以關聯
-          - Page.loadEventFired **不帶任何識別**，所以只有在我們根本拿不到
-            loaderId 與 frameId 時才採信它——有更好的證據就不用猜的。
+        **只有 loaderId 能唯一識別一次導航。**
+
+        先前這裡也接受 frameId 相符的 Page.frameStoppedLoading，那是錯的：
+        frameId 識別的是 frame，不是單次導航——主 frame 在前後頁導航時
+        通常還是同一個 frameId。所以上一頁的停止事件會跟新導航「相符」，
+        競爭根本沒被封住。（而我的測試用 F-OLD 對 F-NEW 來模擬，
+        等於假設前後導航會有不同 frameId——那個假設本身就是錯的，
+        測試因此把有 bug 的行為固定成了預期行為。）
+
+        拿得到 loaderId 時，只認 Page.lifecycleEvent；
+        拿不到時（lifecycle 沒 enable 成功、或舊版 Chrome）才退回那些
+        不可靠的訊號，並且知道自己是在降級。
         """
         method = event.get("method")
         params = event.get("params") or {}
+
         if method == "Page.lifecycleEvent":
             if params.get("name") not in ("load", "networkIdle"):
                 return False
             return not loader_id or params.get("loaderId") == loader_id
+
+        if loader_id:
+            return False        # 有可靠證據就不用關聯不上的訊號
+
+        # 以下是降級路徑：沒有 loaderId 可用時才會走到。
         if method == "Page.frameStoppedLoading":
             return not frame_id or params.get("frameId") == frame_id
         if method == "Page.loadEventFired":
-            return not loader_id and not frame_id
+            return True
         return False
 
     def goto(self, url: str, settle_ms: int = 1200) -> None:
