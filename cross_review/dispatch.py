@@ -27,8 +27,11 @@ def detect(project: Path, transcript_path: str, cursor: int, watermark: float,
     """
     parsed = tx.parse(Path(transcript_path), cursor) if transcript_path else {}
     end_line = parsed.get("end_line", cursor)
-    files, deleted, _source = tx.changed_code_files(project, parsed, since=watermark)
+    files, deleted, _source = tx.changed_code_files(
+        project, parsed, since=watermark, ignore=ignore)
     if ignore:
+        # 走目錄那條路已經剪掉了，但 git status 與工具紀錄那兩條沒有，
+        # 所以這裡仍要再過濾一次。
         keep = lambda p: not _under_any(project, p, ignore)
         files = [f for f in files if keep(f)]
         deleted = [d for d in deleted if keep(d)]
@@ -41,12 +44,7 @@ def _under_any(project: Path, path, prefixes) -> bool:
         rel = Path(path).resolve().relative_to(Path(project).resolve())
     except (ValueError, OSError):
         return False
-    parts = rel.parts
-    for prefix in prefixes:
-        want = Path(str(prefix).replace("\\", "/")).parts
-        if want and parts[:len(want)] == want:
-            return True
-    return False
+    return tx.parts_ignored(rel.parts, tx.ignore_prefixes(prefixes))
 
 
 def next_round(project: Path, state: dict) -> int:

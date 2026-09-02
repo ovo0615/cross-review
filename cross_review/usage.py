@@ -96,8 +96,12 @@ def summary(project: Path) -> str:
         "",
         "共 %d 次審查，%s tokens，累計 %.0f 分鐘" % (len(rows), format(total, ","), secs / 60),
         "",
-        "%-12s %5s %14s %12s %8s" % ("模型", "次數", "tokens", "平均", "分鐘"),
-        "-" * 56,
+        # 欄寬要放得下「模型 / 努力程度」。原本是 12，於是
+        # 「gpt-5.6-sol / high」與「gpt-5.6-sol / medium」都被截成
+        # 「gpt-5.6-sol」，印出兩列一模一樣的東西——而這張表的用途正是
+        # 比較不同設定，最誤導的地方剛好被截掉。
+        "%-24s %5s %14s %12s %8s" % ("模型 / 努力程度", "次數", "tokens", "平均", "分鐘"),
+        "-" * 68,
     ]
     by_model = {}
     for r in rows:
@@ -110,8 +114,8 @@ def summary(project: Path) -> str:
         acc["sec"] += _num(r.get("seconds"), 0.0)
     for key in sorted(by_model, key=lambda k: -by_model[k]["tok"]):
         a = by_model[key]
-        lines.append("%-12s %5d %14s %12s %8.0f"
-                     % (key[:12], a["n"], format(a["tok"], ","),
+        lines.append("%-24s %5d %14s %12s %8.0f"
+                     % (key[:24], a["n"], format(a["tok"], ","),
                         format(a["tok"] // max(1, a["n"]), ","), a["sec"] / 60))
 
     lines += ["", "最近 5 次：", ""]

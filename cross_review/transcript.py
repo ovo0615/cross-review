@@ -9,7 +9,7 @@ import json
 import os
 import re
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import common
 
@@ -400,7 +400,32 @@ def git_diff(project: Path, max_bytes: int, paths=None, base: str = "HEAD",
     return out
 
 
-def walk_code_files(project: Path, since: float) -> list:
+def ignore_prefixes(patterns) -> list:
+    """把 ignore_paths 正規化成可比對的分段 tuple。
+
+    os.path.normcase 在 Windows 會轉小寫、在 POSIX 是原樣。非有不可：
+    Windows 路徑不分大小寫，設定寫 `codex`、目錄實際叫 `Codex` 時，
+    直接比字串會**靜默失效**，原本要排除的改動照樣送審。
+    """
+    out = []
+    for pattern in patterns or []:
+        parts = tuple(os.path.normcase(x) for x in
+                      PurePosixPath(str(pattern).replace("\\", "/")).parts)
+        if parts:
+            out.append(parts)
+    return out
+
+
+def parts_ignored(rel_parts, prefixes) -> bool:
+    """這個相對路徑是否落在任何一個排除前綴底下。
+
+    以路徑分段為單位比對，所以 `theirs` 不會誤傷 `theirs_mine`。
+    """
+    have = tuple(os.path.normcase(str(x)) for x in rel_parts)
+    return any(len(have) >= len(w) and have[:len(w)] == w for w in prefixes)
+
+
+def walk_code_files(project: Path, since: float, ignore=None) -> list:
     """掃出修改時間晚於水位線的程式碼檔。
 
     這是唯一可靠的「發現」機制。git status 與工具呼叫紀錄都只是線索，
@@ -412,7 +437,22 @@ def walk_code_files(project: Path, since: float) -> list:
     走一遍目錄的成本實測：最大的專案 6,377 個項目 165 毫秒，一般專案 15 毫秒內。
     """
     hits = []
-    for dirpath, dirnames, filenames in os.walk(project):
+    prefixes = ignore_prefixes(ignore)
+    # root 必須跟 os.walk 走出來的 dirpath 同源。用 resolve() 的話，Windows
+    # 的 8.3 短檔名（JEFF~1.HON vs jeff.hong）會讓兩者不同源，relpath 算出
+    # 一串 ..\..\，排除規則就靜默失效——測試會過，因為它比對的是最終清單。
+    root = os.path.abspath(str(project))
+    for dirpath, dirnames, filenames in os.walk(root):
+        # 排除的目錄就地剪掉，不要走進去再逐檔過濾——被忽略的目錄很大時，
+        # 掃描成本照樣付了，設定等於只省下送審的部分。
+        if prefixes:
+            try:
+                rel = os.path.relpath(dirpath, root)
+            except ValueError:
+                rel = "."
+            base = () if rel == "." else Path(rel).parts
+            dirnames[:] = [d for d in dirnames
+                           if not parts_ignored(base + (d,), prefixes)]
         # 就地修剪，不要走進去。點開頭的目錄一併跳過：
         # .git、.venv、.claude、.vite、.next、.pytest_cache 全在裡面。
         # 點開頭的目錄照 is_code_file 的同一份白名單處理。
@@ -442,7 +482,8 @@ def walk_code_files(project: Path, since: float) -> list:
     return hits
 
 
-def changed_code_files(project: Path, parsed: dict, since: float = 0.0) -> tuple:
+def changed_code_files(project: Path, parsed: dict, since: float = 0.0,
+                       ignore=None) -> tuple:
     """把 transcript 與 git 的結果合起來，過濾成「這一輪動過的程式碼檔」。
 
     `since` 是上一回合的水位線（epoch 秒）。這個參數不是最佳化，是正確性：
@@ -458,7 +499,7 @@ def changed_code_files(project: Path, parsed: dict, since: float = 0.0) -> tuple
     """
     from_git = git_changed_files(project)
     from_tools = list(parsed.get("write_paths", []))
-    from_walk = walk_code_files(project, since) if since else []
+    from_walk = walk_code_files(project, since, ignore) if since else []
 
     existing, deleted = {}, {}
     for path in from_git + from_tools + from_walk:

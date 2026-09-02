@@ -1405,6 +1405,20 @@ def scenario_other_agents_directories(base: Path) -> None:
     check("ignore_paths 列出的目錄會被排除", "b.py" not in kept, kept)
     check("ignore_paths 不會誤傷我自己的檔案", "a.py" in kept, kept)
 
+    # Windows 路徑不分大小寫。設定寫 codex、目錄實際叫 Codex 時，直接比
+    # 字串會靜默失效，原本要排除的改動照樣送審。
+    for pattern in ("theirs", "THEIRS", "Theirs"):
+        _p3, _e3, files3, _d3 = dispatch.detect(proj, "", 0, 1.0, ignore=[pattern])
+        check("排除規則不分大小寫：" + pattern,
+              "b.py" not in [Path(f).name for f in files3],
+              sorted(Path(f).name for f in files3))
+
+    # 被排除的目錄要在走訪時就剪掉，不是掃完再過濾。
+    walked = tx.walk_code_files(proj, since=1.0, ignore=["theirs"])
+    check("被排除的目錄根本不會被走進去",
+          "b.py" not in [Path(f).name for f in walked],
+          sorted(Path(f).name for f in walked))
+
     # 前綴比對必須以路徑分段為單位，不能只比字串開頭。
     (proj / "theirs_mine").mkdir()
     (proj / "theirs_mine" / "e.py").write_text("e = 1", encoding="utf-8")
