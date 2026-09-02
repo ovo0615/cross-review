@@ -162,36 +162,43 @@ def _state(project: Path, mode: str) -> dict:
                 exact, exact_reason = value, str(event.get("reason") or "")
         elif value > rough:
             rough, rough_reason = value, str(event.get("reason") or "")
-    if exact > time.time():
-        account, account_reason = exact, exact_reason
-    else:
-        account, account_reason = max(exact, rough), (
-            exact_reason if exact >= rough else rough_reason)
+    # 這裡**不做**「明確優先於兜底」的取捨——那要跨模式才算得對。
+    # 只在單一模式內取捨的話，paused_note() 彙整 code 與 visual 時又會退回
+    # 單純取最大值，於是 code 解析到的 13:52 仍會被 visual 兜底的 14:32 拉長。
+    # （上一版就是這樣：修在 _state() 裡，實際生效的判斷卻在 paused_note()。）
+    account = max(exact, rough)
+    account_reason = exact_reason if exact >= rough else rough_reason
+
+    def wrap(failures, paused, reason):
+        return {"failures": failures, "paused_until": paused, "reason": reason,
+                "account_until": account, "account_reason": account_reason,
+                # 分開帶出去，讓 paused_note() 跨模式做「明確優先」的取捨。
+                "exact_until": exact, "exact_reason": exact_reason,
+                "rough_until": rough, "rough_reason": rough_reason}
 
     if not events:
-        return {"failures": legacy["failures"],
-                "paused_until": legacy["paused_until"],
-                "reason": legacy["reason"],
-                "account_until": account, "account_reason": account_reason}
+        return wrap(legacy["failures"], legacy["paused_until"], legacy["reason"])
 
     last_ok = -1
     for i, event in enumerate(events):
         if event.get("ok"):
             last_ok = i
     recent = [e for e in events[last_ok + 1:] if not e.get("ok")]
-    failures = len(recent)
-    reason = str(recent[-1].get("reason") or "") if recent else ""
+    # 記錄裡還沒有任何一次成功時，舊格式累積的失敗次數要繼續算——否則升級
+    # 當下舊檔記著 2 次，新格式再失敗一次只會算成 1，門檻永遠差一步。
+    base = legacy["failures"] if last_ok < 0 else 0
+    failures = len(recent) + base
+    reason = str(recent[-1].get("reason") or "") if recent else legacy["reason"]
 
     # 這個模式的暫停是**推導**出來的，不是存起來的：失敗數達門檻，
     # 就從最後一次失敗算起冷卻。存起來的話又要合併，又回到讀改寫回。
     paused = (_float(recent[-1].get("t")) + COOLDOWN_SEC
-              if failures >= MAX_FAILURES else 0.0)
+              if (failures >= MAX_FAILURES and recent) else 0.0)
     if legacy["paused_until"] > paused:
         paused = legacy["paused_until"]
         if not reason:
             reason = legacy["reason"]
-    return {"failures": failures, "paused_until": paused, "reason": reason,
-            "account_until": account, "account_reason": account_reason}
+    return wrap(failures, paused, reason)
 
 
 def is_quota_error(message: str) -> bool:
@@ -276,7 +283,12 @@ def record_success(project: Path, mode: str = "code") -> None:
     後完成的那個成功很可能是在額度耗盡之前就送出去的，拿它來解除等於
     立刻再燒一次。
     """
-    _append(project, str(mode or "code"), {"t": time.time(), "ok": True})
+    mode = str(mode or "code")
+    # 沒有累積中的失敗時，這一筆成功不帶任何資訊。跳過它，正常運作
+    # （一路成功）的專案記錄就一直是空的，不會每輪長一行。
+    if _state(project, mode)["failures"] <= 0:
+        return
+    _append(project, mode, {"t": time.time(), "ok": True})
 
 
 def paused_note(project: Path, mode: str = None) -> str:
@@ -290,16 +302,26 @@ def paused_note(project: Path, mode: str = None) -> str:
     「審查停著」跟「審查通過」在畫面上長得一模一樣。
     """
     now = time.time()
-    best, best_reason = 0.0, ""
-    for name in _KNOWN_MODES:
-        state = _state(project, name)
-        if state["account_until"] > best:
-            best, best_reason = state["account_until"], state["account_reason"]
-    if best > now:
-        return _note("審查", best, best_reason)
+    # 每個模式只推導一次。原本帳號層級掃一輪、模式暫停再掃一輪，
+    # 同一份記錄被解析兩次。
+    states = {name: _state(project, name) for name in _KNOWN_MODES}
+
+    # 帳號層級的取捨要在**這裡**做，因為只有這裡看得到所有模式：
+    # 伺服器明講的恢復時間優先於兜底的一小時，否則另一個模式沒解析到時間
+    # 而用兜底值，會把 13:52 拉長成 14:32——不會提前重試（安全），但白等。
+    exact = max((s["exact_until"] for s in states.values()), default=0.0)
+    rough = max((s["rough_until"] for s in states.values()), default=0.0)
+    if exact > now:
+        reason = next((s["exact_reason"] for s in states.values()
+                       if s["exact_until"] == exact), "")
+        return _note("審查", exact, reason)
+    if rough > now:
+        reason = next((s["rough_reason"] for s in states.values()
+                       if s["rough_until"] == rough), "")
+        return _note("審查", rough, reason)
 
     for name in ([str(mode)] if mode else _KNOWN_MODES):
-        state = _state(project, name)
+        state = states.get(name) or _state(project, name)
         if state["paused_until"] > now:
             return _note("「" + name + "」審查", state["paused_until"], state["reason"])
     return ""

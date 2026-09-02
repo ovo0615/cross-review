@@ -1677,6 +1677,42 @@ def scenario_breaker_and_usage(base: Path) -> None:
     check("模式暫停的原因不會變成「未記錄」",
           "連線逾時" in breaker.paused_note(proj12b, "code"),
           breaker.paused_note(proj12b, "code"))
+    # 明確恢復時間的優先權必須**跨模式**成立。只在單一模式內取捨的話，
+    # paused_note() 彙整兩個模式時又退回單純取最大值，code 解析到的時刻
+    # 仍會被 visual 兜底的一小時拉長。上一版就是這樣，而我當時的驗證用例
+    # 剛好讓兜底值比明確時間更早，所以什麼都沒證明。
+    from datetime import datetime as _dt, timedelta as _td
+    proj14 = base / "breakerproj14"
+    (proj14 / ".claude" / "review").mkdir(parents=True)
+    soon = (_dt.now() + _td(minutes=20)).strftime("%I:%M %p").lstrip("0")
+    breaker.record_failure(
+        proj14, "You have hit your usage limit. try again at " + soon, "code")
+    only_code = breaker.paused_note(proj14, "code")
+    breaker.record_failure(proj14, "You have hit your usage limit.", "visual")
+    check("另一個模式的兜底期限不會把明確時間拉長",
+          breaker.paused_note(proj14, "code") == only_code,
+          (only_code, breaker.paused_note(proj14, "code")))
+
+    # 升級當下舊檔記著的失敗次數要繼續算，直到記錄裡出現第一次成功。
+    proj15 = base / "breakerproj15"
+    (proj15 / ".claude" / "review").mkdir(parents=True)
+    common.write_json(proj15 / ".claude" / "review" / "breaker.code.json",
+                      {"failures": 2, "paused_until": 0.0,
+                       "account_until": 0.0, "reason": "boom"})
+    note15 = breaker.record_failure(proj15, "boom", "code")
+    check("舊格式的失敗次數會累加進門檻", bool(note15), repr(note15))
+    breaker.record_success(proj15, "code")
+    check("成功之後舊次數不再累加",
+          breaker.paused_note(proj15, "code") == "",
+          breaker.paused_note(proj15, "code"))
+
+    # 一路成功的專案不該每輪長一行——那筆成功不帶任何資訊。
+    proj16 = base / "breakerproj16"
+    (proj16 / ".claude" / "review").mkdir(parents=True)
+    for _ in range(20):
+        breaker.record_success(proj16, "code")
+    check("沒有失敗可清時不寫成功事件",
+          not (proj16 / ".claude" / "review" / "breaker.code.log").exists())
 
     # 期限來自舊版的額度限制時，原因也要跟著它走。模式檔裡留著更早的一般
     # 錯誤的話，訊息會變成「因為連線逾時所以等到 13:27」，使用者判斷不了
