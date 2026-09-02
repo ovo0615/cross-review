@@ -1384,6 +1384,42 @@ def scenario_referenced_context(base: Path) -> None:
           any("拆檔案" in x for x in parsed["referenced_context"]),
           parsed["referenced_context"])
 
+    # 真實情況：助手上一回合提建議、回合結束游標推進、使用者這一回合才說
+    # 「可以動手」——那則建議**永遠**在游標之前。上面那條 start_line=0 的
+    # 斷言測不到這件事（第 32 回合的材料包就是這樣缺掉的）。
+    parsed_real = tx.parse(t, 2)
+    check("助手回覆在游標之前也要抓得到",
+          any("拆檔案" in x for x in parsed_real["referenced_context"]),
+          parsed_real["referenced_context"])
+
+    # 否定的指代不可以收——收了材料包會宣稱「使用者已經同意」，
+    # 等於把明確否決的方案反向列成驗收需求。
+    for word in ("不要照做", "我不同意你的建議", "don't do it"):
+        rows_n = rows[:2] + [{"type": "user",
+                              "message": {"role": "user", "content": word}}]
+        tn = base / ("refneg_" + str(abs(hash(word)) % 10000) + ".jsonl")
+        tn.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows_n),
+                      encoding="utf-8")
+        check("否定的指代不收：" + word,
+              tx.parse(tn, 0)["referenced_context"] == [],
+              tx.parse(tn, 0)["referenced_context"])
+
+    # 助手訊息的 content 可能是字串而不是 block 陣列。只處理陣列的話，
+    # 不但抓不到，還會留著更早那一則，指代指向錯誤的內容。
+    rows_s = [
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "舊的建議"}]}},
+        {"type": "assistant", "message": {"role": "assistant",
+                                          "content": "新的建議（字串型態）"}},
+        {"type": "user", "message": {"role": "user", "content": "依照你的建議"}},
+    ]
+    ts = base / "refstr.jsonl"
+    ts.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows_s),
+                  encoding="utf-8")
+    got_s = tx.parse(ts, 0)["referenced_context"]
+    check("字串型態的助手訊息也抓得到，而且抓的是最近那一則",
+          got_s and "新的建議" in got_s[0], got_s)
+
     rows2 = rows[:2] + [{"type": "user",
                          "message": {"role": "user", "content": "改成藍色"}}]
     t2 = base / "refctx2.jsonl"
@@ -1409,6 +1445,7 @@ def scenario_referenced_context(base: Path) -> None:
 
 
 def scenario_breaker_and_usage(base: Path) -> None:
+    from cross_review import common
     """斷路器與用量帳本。錯誤訊息是 2026-09-02 額度真的用完時擷取的原文。"""
     sys.path.insert(0, str(TOOL_ROOT))
     from cross_review import breaker, common, usage
@@ -1512,9 +1549,40 @@ def scenario_breaker_and_usage(base: Path) -> None:
     check("失敗計數寫在各模式自己的檔案裡",
           (rdir7 / "breaker.code.json").exists(),
           sorted(f.name for f in rdir7.glob("breaker*.json")))
-    check("全域檔只放額度暫停",
-          "failures" not in json.loads((rdir7 / "breaker.json").read_text(encoding="utf-8")),
-          json.loads((rdir7 / "breaker.json").read_text(encoding="utf-8")))
+    check("沒有任何共用的狀態檔",
+          not (rdir7 / "breaker.json").exists(),
+          sorted(f.name for f in rdir7.glob("breaker*.json")))
+
+    # 兩個模式解析到的恢復時間不一定相同：一邊從訊息拿到明確時刻，另一邊
+    # 沒拿到而用一小時兜底。共寫一個檔的話，後寫的兜底值會把期限蓋短。
+    proj8 = base / "breakerproj8"
+    (proj8 / ".claude" / "review").mkdir(parents=True)
+    breaker.record_failure(proj8, REAL, "code")            # 帶明確恢復時間
+    long_note = breaker.paused_note(proj8, "code")
+    breaker.record_failure(proj8, "You've hit your usage limit.", "visual")  # 只能兜底
+    check("兜底的期限不會把明確的期限蓋短",
+          breaker.paused_note(proj8, "code") == long_note,
+          (long_note, breaker.paused_note(proj8, "code")))
+
+    # 舊格式升級：單模式的暫停不可以被當成帳號層級的而擋住另一個模式。
+    proj9 = base / "breakerproj9"
+    (proj9 / ".claude" / "review").mkdir(parents=True)
+    common.write_json(proj9 / ".claude" / "review" / "breaker.json",
+                      {"failures": {"code": 3}, "paused_until": time.time() + 3600,
+                       "pause_kind": "failures", "pause_mode": "code",
+                       "reason": "boom"})
+    check("舊格式的單模式暫停仍只擋那個模式",
+          breaker.paused_note(proj9, "code") != ""
+          and breaker.paused_note(proj9, "visual") == "",
+          "code=%r visual=%r" % (breaker.paused_note(proj9, "code"),
+                                 breaker.paused_note(proj9, "visual")))
+    common.write_json(proj9 / ".claude" / "review" / "breaker.json",
+                      {"paused_until": time.time() + 3600, "pause_kind": "quota",
+                       "reason": "額度"})
+    (proj9 / ".claude" / "review" / "breaker.code.json").unlink(missing_ok=True)
+    check("舊格式的額度暫停仍擋所有模式",
+          breaker.paused_note(proj9, "visual") != "",
+          breaker.paused_note(proj9, "visual"))
 
     # 短暫限流沒有恢復時間就不該當成額度耗盡而停一小時。
     proj4 = base / "breakerproj4"

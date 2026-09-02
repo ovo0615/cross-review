@@ -3,22 +3,23 @@
 審查失敗時每一輪都重試是有害的：每次都再燒一次額度、再等一次、
 再產生一次噪音，而且永遠不會自己停。
 
-## 為什麼狀態要拆成好幾個檔案
+## 為什麼沒有共用的狀態檔
 
 「讀出整份 → 改 → 整份寫回」在有第二個寫入者時就是競態。這個工具有
 **三個**會動狀態的行程：hook、程式碼審查、視覺審查。後兩者是併行的。
 
-第一次拆檔（從 state.json 拆出 breaker.json）只解決了 hook 與審查之間的
-衝突，漏了「背景審查自己就有兩個行程」。實測重現過：code 記下額度暫停之後，
-visual 用它更早的快照整份寫回，暫停就消失了——而額度用完時兩個審查
-幾乎同時失敗，所以那正是這個競態的典型情況，不是窄窗。
+拆檔拆了三次才拆乾淨，每次都是同一個道理沒推到底：
 
-所以現在的規則是**每個檔案只有一個寫入者**：
+1. 一開始全部放 state.json —— hook 與審查互相覆蓋。
+2. 拆出 breaker.json —— 但背景審查自己就有兩個行程，仍然互相覆蓋。
+   實測重現過：code 記下額度暫停後，visual 用更早的快照寫回，暫停消失。
+3. 拆成 breaker.<模式>.json，但額度暫停還留在共用的 breaker.json。
+   當時的理由是「兩個模式寫進去的是同一件事實」——**那是錯的**：
+   一邊可能從訊息解析到明確的恢復時間，另一邊沒解析到而用一小時兜底，
+   後寫的那個會把期限縮短，工具就在額度還受限時提前重試。
 
-* `breaker.<模式>.json`  只有那個模式會寫（失敗計數、該模式的暫停）
-* `breaker.json`         全域的額度／限流暫停。兩個模式都可能寫，但寫進去的
-                         是同一件事實（伺服器什麼時候讓我們再試），
-                         互相覆蓋不會失真。
+現在**沒有任何檔案有兩個寫入者**：每個模式只寫 `breaker.<模式>.json`，
+帳號層級的暫停也記在各自的檔案裡，讀的時候取所有模式的**最大值**。
 """
 from __future__ import annotations
 
@@ -45,37 +46,11 @@ MAX_FAILURES = 3          # 連續失敗幾次才跳閘（單次可能只是網�
 COOLDOWN_SEC = 3600       # 非額度類失敗的冷卻時間
 
 _KNOWN_MODES = ("code", "visual")
-
-
-def _global_path(project: Path) -> Path:
-    return common.review_dir(project) / "breaker.json"
+_LEGACY_FILE = "breaker.json"      # 舊格式，只讀不寫
 
 
 def _mode_path(project: Path, mode: str) -> Path:
     return common.review_dir(project) / ("breaker." + str(mode) + ".json")
-
-
-def _load_global(project: Path) -> dict:
-    data = common.read_json(_global_path(project))
-    if not isinstance(data, dict):
-        data = {}
-    return {
-        "paused_until": _float(data.get("paused_until")),
-        "pause_kind": str(data.get("pause_kind") or ""),
-        "reason": str(data.get("reason") or ""),
-    }
-
-
-def _load_mode(project: Path, mode: str) -> dict:
-    data = common.read_json(_mode_path(project, mode))
-    if not isinstance(data, dict):
-        data = {}
-    failures = data.get("failures")
-    return {
-        "failures": failures if isinstance(failures, int) and failures >= 0 else 0,
-        "paused_until": _float(data.get("paused_until")),
-        "reason": str(data.get("reason") or ""),
-    }
 
 
 def _float(value) -> float:
@@ -83,6 +58,51 @@ def _float(value) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _from_legacy(project: Path, mode: str) -> dict:
+    """把舊版的單一檔案讀成這個模式的狀態。只讀，不回寫。
+
+    沒有這段的話，升級之後舊的 `pause_kind == "failures"` 會被當成帳號層級的
+    暫停，同時擋住 code 與 visual，而且成功也解除不了——使用者只會看到
+    「審查一直停著」而沒有任何線索。
+    """
+    data = common.read_json(common.review_dir(project) / _LEGACY_FILE)
+    if not isinstance(data, dict):
+        return {"failures": 0, "paused_until": 0.0, "account_until": 0.0, "reason": ""}
+
+    fails = data.get("failures")
+    if isinstance(fails, dict):
+        count = fails.get(mode)
+    else:
+        count = data.get("consecutive_failures")
+    count = count if isinstance(count, int) and count >= 0 else 0
+
+    kind = str(data.get("pause_kind") or "")
+    until = _float(data.get("paused_until"))
+    mine, account = 0.0, 0.0
+    if kind in ("quota", "rate"):
+        account = until
+    elif kind == "failures" and str(data.get("pause_mode") or "") == mode:
+        mine = until
+    entry = (data.get("mode_pause") or {}).get(mode)
+    if isinstance(entry, dict):
+        mine = max(mine, _float(entry.get("until")))
+    return {"failures": count, "paused_until": mine,
+            "account_until": account, "reason": str(data.get("reason") or "")}
+
+
+def _load_mode(project: Path, mode: str) -> dict:
+    data = common.read_json(_mode_path(project, mode))
+    if not isinstance(data, dict) or not data:
+        return _from_legacy(project, mode)
+    failures = data.get("failures")
+    return {
+        "failures": failures if isinstance(failures, int) and failures >= 0 else 0,
+        "paused_until": _float(data.get("paused_until")),
+        "account_until": _float(data.get("account_until")),
+        "reason": str(data.get("reason") or ""),
+    }
 
 
 def is_quota_error(message: str) -> bool:
@@ -136,16 +156,12 @@ def record_failure(project: Path, message: str, mode: str = "code") -> str:
     reset_at = parse_reset_time(message)
     quota = is_quota_error(message)
     if quota or (_RATE.search(message or "") and reset_at):
-        # 帳號層級的限制，擋掉所有模式。寫進全域檔——另一個模式也可能同時
-        # 寫同一件事實，互相覆蓋不會失真。
+        # 帳號層級的限制，擋掉所有模式。記在自己的檔案裡，讀的時候取最大值——
+        # 寫進共用檔的話，兜底的一小時會把另一邊解析到的明確期限蓋短。
         until = reset_at or (time.time() + COOLDOWN_SEC)
-        common.write_json(_global_path(project), {
-            "paused_until": until,
-            "pause_kind": "quota" if quota else "rate",
-            "reason": str(message)[:500],
-        })
+        data["account_until"] = max(data["account_until"], until)
         note = (("額度已用完，審查暫停到 " if quota else "被限流，審查暫停到 ")
-                + _stamp(until) + "（時間到自動恢復）")
+                + _stamp(data["account_until"]) + "（時間到自動恢復）")
     elif data["failures"] >= MAX_FAILURES:
         data["paused_until"] = time.time() + COOLDOWN_SEC
         note = ("「" + mode + "」連續 " + str(data["failures"])
@@ -161,30 +177,40 @@ def record_failure(project: Path, message: str, mode: str = "code") -> str:
 def record_success(project: Path, mode: str = "code") -> None:
     """成功一次就把**這個模式**的計數與暫停歸零。
 
-    絕不碰全域檔。額度／限流的暫停只有時間能解除：那是帳號層級的限制，
-    跟哪個模式成功無關，而且併行派工時，後完成的那個成功很可能是在額度
-    耗盡之前就送出去的，拿它來解除等於立刻再燒一次。
+    帳號層級的暫停（account_until）不清：那是額度／限流，只有時間能解除。
+    併行派工時，後完成的那個成功很可能是在額度耗盡之前就送出去的，
+    拿它來解除等於立刻再燒一次。
     """
     mode = str(mode or "code")
     data = _load_mode(project, mode)
     if data["failures"] or data["paused_until"]:
-        common.write_json(_mode_path(project, mode),
-                          {"failures": 0, "paused_until": 0.0, "reason": ""})
+        common.write_json(_mode_path(project, mode), {
+            "failures": 0,
+            "paused_until": 0.0,
+            "account_until": data["account_until"],
+            "reason": "",
+        })
 
 
 def paused_note(project: Path, mode: str = None) -> str:
     """目前在暫停中的話，回傳要告訴使用者的話；否則空字串。
 
-    傳 mode 就只問那個模式。連續失敗造成的暫停只擋那個模式——
-    程式碼審查壞掉不該連帶讓視覺審查也停下來。
+    傳 mode 就只問那個模式的連續失敗暫停——程式碼審查壞掉不該連帶讓
+    視覺審查也停下來。帳號層級的暫停一律擋所有模式，而且要看過每一個
+    模式的檔案取最大值：期限是各自從錯誤訊息解析出來的，不一定相同。
 
     暫停期間每一輪都講一次。這件事寧可吵也不能忘記——
     「審查停著」跟「審查通過」在畫面上長得一模一樣。
     """
     now = time.time()
-    g = _load_global(project)
-    if g["paused_until"] > now:
-        return _note("審查", g["paused_until"], g["reason"])
+    best, reason = 0.0, ""
+    for name in _KNOWN_MODES:
+        data = _load_mode(project, name)
+        if data["account_until"] > best:
+            best, reason = data["account_until"], data["reason"]
+    if best > now:
+        return _note("審查", best, reason)
+
     for name in ([str(mode)] if mode else _KNOWN_MODES):
         data = _load_mode(project, name)
         if data["paused_until"] > now:

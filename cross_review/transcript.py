@@ -68,7 +68,57 @@ _REFERENTIAL = re.compile(
     "|第[ ]*[0-9]+[ ]*項|那幾項|上面那"
     "|your (recommendation|suggestion)|as you (suggested|said)"
     "|go ahead|do it", re.I)
+# 否定的指代。命中就不收——「不要照做」「我不同意你的建議」原本會被
+# _REFERENTIAL 命中，材料包接著宣稱「使用者已經同意」，等於把明確否決的
+# 方案反向列成驗收需求。那比不做這個功能更糟。
+# 這裡刻意寧可漏收：漏收只是審查者少一份脈絡，誤收是把意思講反。
+_NEGATED = re.compile(
+    "不要|不用|不必|別[這那照]|不同意|不採用|不接受|不需要|沒有要|先不|暫不|"
+    "先別|等一下|再想|"
+    "do not|don't|dont|no need|not yet|hold off|skip", re.I)
 _REFERENCE_MAX_BYTES = 6000
+
+
+def _shorten_reference(text: str) -> str:
+    """太長的回覆取尾巴——建議與結論通常寫在最後。"""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _REFERENCE_MAX_BYTES:
+        return text
+    return ("**[前面截斷]**\n"
+            + encoded[-_REFERENCE_MAX_BYTES:].decode("utf-8", "ignore"))
+
+
+def _assistant_text_before(transcript_path: Path, start_line: int) -> str:
+    """游標之前最近的一則助手回覆。
+
+    非有不可：真實流程是「執行者上一回合提建議 → 回合結束、游標推進 →
+    使用者這一回合說『可以動手』」，所以那則建議**永遠**在游標之前，
+    只掃視窗內的話永遠抓不到。（第 32 回合的材料包就是這樣缺掉的；
+    我的測試把兩者放在同一個視窗裡，所以測不出來。）
+
+    從游標往回找，找到第一則就停——通常只差一兩行。
+    """
+    if start_line <= 0 or not transcript_path.exists():
+        return ""
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines[:start_line]):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if obj.get("type") != "assistant":
+            continue
+        said = _text_of(obj.get("message") or {}).strip()
+        if said:
+            return _shorten_reference(said)
+    return ""
 
 
 def parse(transcript_path: Path, start_line: int = 0, stop_line: int = 0) -> dict:
@@ -146,8 +196,11 @@ def parse(transcript_path: Path, start_line: int = 0, stop_line: int = 0) -> dic
                 text = _clean_user_text(raw_text)
                 if text:
                     result["user_requests"].append(text)
-                    if last_assistant and _REFERENTIAL.search(text):
-                        result["referenced_context"].append(last_assistant)
+                    if _REFERENTIAL.search(text) and not _NEGATED.search(text):
+                        said = last_assistant or _assistant_text_before(
+                            transcript_path, start_line)
+                        if said:
+                            result["referenced_context"].append(said)
                 continue
 
             if kind != "assistant":
@@ -155,16 +208,12 @@ def parse(transcript_path: Path, start_line: int = 0, stop_line: int = 0) -> dic
 
             # 記住這一則助手回覆的文字。只有在下一則使用者發言出現指代
             # （「依照你的建議」之類）時才會被收進材料包，平常不佔任何空間。
-            said = "\n".join(
-                b.get("text", "") for b in (message.get("content") or [])
-                if isinstance(b, dict) and b.get("type") == "text").strip()
+            # 用 _text_of()：助手訊息的 content 可能是字串而不是 block 陣列。
+            # 只處理陣列的話，遇到字串型態不但抓不到，還會留著**更早**那一則，
+            # 於是指代指向錯誤的內容——比漏抓更糟。
+            said = _text_of(message).strip()
             if said:
-                encoded = said.encode("utf-8")
-                if len(encoded) > _REFERENCE_MAX_BYTES:
-                    # 取尾巴：建議與結論通常寫在最後。
-                    said = ("**[前面截斷]**\n"
-                            + encoded[-_REFERENCE_MAX_BYTES:].decode("utf-8", "ignore"))
-                last_assistant = said
+                last_assistant = _shorten_reference(said)
 
             for block in message.get("content") or []:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
