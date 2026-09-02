@@ -1,0 +1,99 @@
+# 操作說明
+
+## 前置需求
+
+| 需要 | 用途 | 確認 |
+|---|---|---|
+| Python 3.9+ | 跑工具 | `py -3 --version` |
+| Codex CLI（已登入） | 當審查者 | `codex --version` |
+| Google Chrome | 只有視覺審查要 | 裝在預設位置即可 |
+
+**不需要 `pip install` 任何東西**，只用標準函式庫。
+
+## 安裝
+
+加進 `~/.claude/settings.json` 的 `Stop`：
+
+```json
+{ "type": "command", "command": "py -3 \"<工具路徑>\\run_hook.py\"" }
+```
+
+放全域＝每個目錄都生效；放專案的 `.claude/settings.json`＝只有那個專案。
+
+## 三個指令
+
+```bash
+py -3 <工具>\run_review.py --now "<專案>"                  # 送審
+py -3 <工具>\run_review.py --now "<專案>" --mode visual    # 只看畫面
+py -3 <工具>\run_review.py --usage "<專案>"                # 查用量
+```
+
+對 Claude 說「審查」也可以。
+
+## 觸發模式
+
+| 模式 | 行為 |
+|---|---|
+| `manual`（預設） | 不自動送，每輪只報累積量 |
+| `threshold` | 累積 ≥ 10 檔或 ≥ 20 KB 才送 |
+| `auto` | 有改動就送 |
+
+```bash
+py -3 <工具>\run_review.py --trigger threshold "<專案>"
+```
+
+**授權寫在 `~/.claude/cross-review.json`，不是專案裡。** 專案的 `trigger` 只能收緊、放不寬——否則 clone 回來的版本庫能自己開啟自動送審。
+
+沒送審的回合什麼都不推進，累積量會一路長大，不會漏。
+
+## 視覺審查
+
+dev server 要自己先開著。設定 `<專案>/.claude/review/config.json`：
+
+```json
+"shots": [{
+  "name": "主畫面",
+  "url": "http://localhost:5190/",
+  "width": 1440, "height": 900,
+  "actions": [
+    { "do": "click", "text": "開始" },
+    { "do": "wait",  "ms": 1200 },
+    { "do": "shot",  "name": "Layout" }
+  ]
+}]
+```
+
+動作：`click`（用畫面文字）、`type`、`scroll`、`wait`、`shot`。
+
+第一次跑會建基準圖，之後每次跟它比。要重設就刪 `baseline/` 裡對應的檔案。
+
+## 產出位置
+
+`<專案>/.claude/review/`：報告、材料包、基準圖、用量帳本、狀態。不進版本庫。
+
+## 疑難排解
+
+| 症狀 | 處理 |
+|---|---|
+| 完全沒訊息 | 這輪沒改程式碼（正常），或 session 開在裝 hook 之前 |
+| 找不到 codex.exe | 沒裝或沒登入 |
+| 一個畫面都沒拍到 | dev server 沒開 |
+| 基準圖整批不符 | 視窗尺寸變了，或刪掉 `baseline/` 重建 |
+| 掃到別人的檔案 | 寫進 `ignore_paths`（巢狀 repo／worktree 會自動排除） |
+| 額度用完 | 自動暫停到恢復時間，不用處理 |
+| 要完全關掉 | `config.json` 的 `enabled` 設 `false` |
+
+## 換模型
+
+```json
+"codex_model": "gpt-5.6-sol",
+"codex_reasoning_effort": "high"
+```
+
+`sol`／`terra`／`luna` 由強到快；effort 可到 `ultra`。**不要留空**——留空會沿用你自己的 Codex 設定，審查品質會跟著它漂移。
+
+## 注意
+
+材料包送的是**檔案全文**。全域安裝時任何目錄開 session 都算專案，所以預設 `manual`，你說了才送。
+
+設計決策見 [`docs/adr/`](docs/adr/)。
