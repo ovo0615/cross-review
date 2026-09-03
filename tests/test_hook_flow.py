@@ -1345,6 +1345,33 @@ def scenario_trigger_modes(base: Path) -> None:
 
 
 
+def scenario_generated_files(base: Path) -> None:
+    """機器產生的檔案不進材料包。
+
+    實測：一個專案第 12 輪改到 10 個檔案共 247 KB，package-lock.json 一個就佔
+    139 KB。它沒進 git diff（走送全文那條路），從材料包第 44,678 個字元一路吃到
+    200 KB 上限，後面 6 個真正的程式碼檔全部擠不進來——審查者的結論是
+    「完整收錄 0 個」，118,602 個 token 幾乎都花在鎖定檔上。
+    """
+    from cross_review import common as _cm, transcript as _tx
+    for name in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+                 "Cargo.lock", "go.sum", "uv.lock", "composer.lock"):
+        check("鎖定檔不收：" + name, not _cm.is_code_file("web/" + name))
+    for name in ("app.min.js", "styles.min.css", "vendor.bundle.js", "main.chunk.js"):
+        check("打包產物不收：" + name, not _cm.is_code_file("src/" + name))
+    for name in ("package.json", "tsconfig.json", "app.js", "App.tsx", "main.css"):
+        check("真正的原始碼照收：" + name, _cm.is_code_file("src/" + name))
+
+    # 走訪那條路也要一致，否則兩邊判準不同會很難追。
+    proj = base / "genproj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "src" / "package-lock.json").write_text("{}", encoding="utf-8")
+    (proj / "src" / "app.min.js").write_text("x", encoding="utf-8")
+    (proj / "src" / "app.js").write_text("x", encoding="utf-8")
+    found = sorted(Path(f).name for f in _tx.walk_code_files(proj, since=1.0))
+    check("走訪也排除機器產生的檔案", found == ["app.js"], found)
+
+
 def scenario_manual_gate(base: Path) -> None:
     """manual 模式下，執行者不能自己送審。
 
@@ -2086,6 +2113,7 @@ def main() -> int:
         scenario_trigger_modes(base)
         scenario_user_consent(base)
         scenario_manual_gate(base)
+        scenario_generated_files(base)
         scenario_receipt(base)
         scenario_other_agents_directories(base)
         scenario_referenced_context(base)

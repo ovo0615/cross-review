@@ -171,6 +171,26 @@ ALLOWED_DOT_DIRS = {
 }
 
 
+# 機器產生的檔案。副檔名看起來像程式碼（.json、.js），內容卻是給機器讀的，
+# 而且往往非常大。
+#
+# 實測：一個專案的第 12 輪改到 10 個檔案共 247 KB，其中 package-lock.json
+# 一個就佔 139 KB。它沒有出現在 git diff 裡（走了送全文那條路），從材料包的
+# 第 44,678 個字元一路吃到 200 KB 上限，後面 6 個真正的程式碼檔全部擠不進來。
+# 審查者的結論是「完整收錄 0 個」——118,602 個 token 幾乎都花在鎖定檔上。
+#
+# 這些檔案改了也不需要人看：它們是別的動作的產物，要看的是那個動作。
+IGNORED_FILENAMES = {
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    "bun.lockb", "deno.lock",
+    "poetry.lock", "pipfile.lock", "uv.lock", "requirements.lock",
+    "cargo.lock", "composer.lock", "gemfile.lock", "go.sum", "packages.lock.json",
+}
+
+# 打包／壓縮後的產物。副檔名仍是 .js／.css，但那是編譯結果不是原始碼。
+GENERATED_INFIXES = (".min.", ".bundle.", ".chunk.")
+
+
 def is_code_file(path: str) -> bool:
     p = Path(path)
     if any(part in IGNORED_PARTS for part in p.parts):
@@ -182,6 +202,11 @@ def is_code_file(path: str) -> bool:
     for part in p.parts[:-1]:
         if part.startswith(".") and part not in ALLOWED_DOT_DIRS:
             return False
+    name = p.name.lower()
+    if name in IGNORED_FILENAMES:
+        return False
+    if any(mark in name for mark in GENERATED_INFIXES):
+        return False
     suffix = p.suffix.lower()
     if suffix in NEVER_INCLUDE_SUFFIXES:
         return False

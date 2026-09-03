@@ -527,6 +527,11 @@ def walk_code_files(project: Path, since: float, ignore=None) -> list:
         for name in filenames:
             if os.path.splitext(name)[1].lower() not in common.CODE_SUFFIXES:
                 continue
+            lower = name.lower()
+            if lower in common.IGNORED_FILENAMES:
+                continue
+            if any(mark in lower for mark in common.GENERATED_INFIXES):
+                continue
             path = os.path.join(dirpath, name)
             try:
                 if os.stat(path).st_mtime > since:
