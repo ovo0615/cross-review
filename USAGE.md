@@ -15,10 +15,8 @@
 **一個專案一個專案裝**，一行指令：
 
 ```bash
-py -3 <工具>
-un_review.py --install   "<專案>"
-py -3 <工具>
-un_review.py --uninstall "<專案>"
+py -3 <工具>\run_review.py --install   "<專案>"
+py -3 <工具>\run_review.py --uninstall "<專案>"
 ```
 
 它只動 `<專案>/.claude/settings.json` 裡屬於本工具的那一筆，其他設定原封不動；
