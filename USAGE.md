@@ -12,13 +12,21 @@
 
 ## 安裝
 
-加進 `~/.claude/settings.json` 的 `Stop`：
+**一個專案一個專案裝**，一行指令：
 
-```json
-{ "type": "command", "command": "py -3 \"<工具路徑>\\run_hook.py\"" }
+```bash
+py -3 <工具>un_review.py --install   "<專案>"
+py -3 <工具>un_review.py --uninstall "<專案>"
 ```
 
-放全域＝每個目錄都生效；放專案的 `.claude/settings.json`＝只有那個專案。
+它只動 `<專案>/.claude/settings.json` 裡屬於本工具的那一筆，其他設定原封不動；
+重複執行不會裝兩次。**新開的 session 才會生效，既有的要重開。**
+
+**不要裝在全域。** 材料包送的是檔案全文，而全域安裝等於任何目錄開 session 都被
+當成專案——實測餵一個 `%TEMP%` 路徑給 hook，它照樣認成專案、在那裡建出
+`.claude/review/` 並要求送審。**安裝這個動作本身就是「這個專案的程式碼可以出去」
+的同意。**
+
 
 ## 三個指令
 
