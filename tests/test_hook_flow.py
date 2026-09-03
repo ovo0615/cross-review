@@ -65,6 +65,11 @@ def touch(path: Path, content: str) -> None:
 FAKE_HOME = None
 
 
+REAL_QUOTA_ERROR = ("codex 結束（exit 1）但沒有輸出："
+                    "ERROR: You have hit your usage limit. "
+                    "try again at 11:59 PM.")
+
+
 def force_auto(project: Path) -> None:
     """把專案釘成 auto 觸發。
 
@@ -1345,6 +1350,53 @@ def scenario_trigger_modes(base: Path) -> None:
 
 
 
+def scenario_quiet(base: Path) -> None:
+    """remind=false：hook 照跑、狀態照維持，只是不出聲。
+
+    要驗的是「安靜」不等於「沒在做事」——水位線與累積清單仍然要正確，
+    否則使用者主動說審查時會拿到錯的範圍。失敗狀態不受這個開關影響。
+    """
+    from cross_review import common as _cm, dispatch as _dp
+    proj = base / "quietproj"
+    (proj / "src").mkdir(parents=True)
+    (proj / ".claude" / "review").mkdir(parents=True)
+    (proj / "src" / "a.py").write_text("a = 1", encoding="utf-8")
+    cfg_path = proj / ".claude" / "review" / "config.json"
+    time.sleep(0.05)
+    t = base / "quiet.jsonl"
+    t.write_text("", encoding="utf-8")
+
+    cfg_path.write_text(json.dumps({"trigger": "manual", "remind": True}),
+                        encoding="utf-8")
+    touch(proj / "src" / "a.py", "a = 2")
+    out, _ = run_hook(proj, t)
+    check("remind 開著時會報累積量",
+          "累積" in (out or {}).get("systemMessage", ""), out)
+
+    cfg_path.write_text(json.dumps({"trigger": "manual", "remind": False}),
+                        encoding="utf-8")
+    touch(proj / "src" / "b.py", "b = 1")
+    out, _ = run_hook(proj, t)
+    check("remind 關掉時完全安靜", out is None, out)
+
+    # 安靜不代表沒在記：累積清單要一路長大。
+    state = json.loads((proj / ".claude" / "review" / "state.json")
+                       .read_text(encoding="utf-8"))
+    _p, _e, files, deleted = _dp.detect(
+        proj, str(t), int(state.get("cursor", 0)),
+        _dp.watermark_for(state, str(t)))
+    names = sorted(Path(f).name for f in files)
+    check("安靜模式下累積量仍然正確", names == ["a.py", "b.py"], names)
+
+    # 失敗狀態不受這個開關影響。
+    from cross_review import breaker as _bk
+    _bk.record_failure(proj, REAL_QUOTA_ERROR, "code")
+    touch(proj / "src" / "c.py", "c = 1")
+    out, _ = run_hook(proj, t)
+    check("安靜模式下斷路器仍然出聲",
+          "暫停" in (out or {}).get("systemMessage", ""), out)
+
+
 def scenario_install(base: Path) -> None:
     """逐專案安裝／移除 Stop hook。
 
@@ -2163,6 +2215,7 @@ def main() -> int:
         scenario_manual_gate(base)
         scenario_generated_files(base)
         scenario_install(base)
+        scenario_quiet(base)
         scenario_receipt(base)
         scenario_other_agents_directories(base)
         scenario_referenced_context(base)

@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import common
+from .common import as_bool
 from .cdp import LOCAL_HOSTS, Browser
 
 CHROME_CANDIDATES = [
@@ -86,26 +87,6 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
-def as_bool(value, default: bool = False) -> bool:
-    """安全旗標只接受真正的布林語意，不用 truthiness。
-
-    設定檔寫成字串 "false" 時，truthiness 判斷會當成 true——
-    邊界就被靜默打開了，而使用者以為自己關著。
-    """
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in ("true", "1", "yes", "on"):
-            return True
-        if text in ("false", "0", "no", "off", ""):
-            return False
-        return default          # 看不懂的字串一律用預設（也就是比較安全的那邊）
-    if isinstance(value, (int, float)):
-        return bool(value)
-    return default
 
 
 def page_is_ready(url: str, timeout: float = 5.0) -> str:

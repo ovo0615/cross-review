@@ -18,6 +18,25 @@ from . import common, transcript as tx
 RECEIPT = "reviewed.json"
 
 
+def watermark_for(state: dict, transcript_path: str) -> float:
+    """這個專案「從哪個時間點之後的改動才算」。
+
+    state 裡還沒有水位線時（manual 模式下 hook 不派工就不推進，所以可能一直
+    沒有），用逐字稿的建立時間當起點——那是這個 session 開始的時刻。
+    不能用 0：那會讓「比 0 新」變成整個專案的所有檔案。
+
+    這個退路原本只寫在 run_now() 裡，--status 少了它就一律顯示 0 個未審。
+    """
+    value = float(state.get("watermark") or 0.0)
+    if value:
+        return value
+    try:
+        return Path(transcript_path).stat().st_ctime
+    except (OSError, TypeError, ValueError):
+        return time.time() - 900
+
+
+
 def detect(project: Path, transcript_path: str, cursor: int, watermark: float,
            ignore=None):
     """這一輪（或累積至今）改到了什麼。回傳 (parsed, end_line, files, deleted)。

@@ -292,6 +292,16 @@ DEFAULT_CONFIG = {
     "code_review": True,
     "visual_review": True,
     "trigger": "manual",
+    # 沒送審的回合要不要印那行「累積 N 個檔案還沒審查」。
+    #
+    # 關掉之後 hook 仍然照跑，只是完全安靜：它繼續維持水位線、逐字稿位置與
+    # diff 基準——那些正是 skill 自己補不回來的東西（沒有水位線就只剩
+    # git status，而 git status 在 commit 之後是乾淨的，等於審不到已提交的work）。
+    #
+    # 預設仍然是 True：新專案應該先吵，由使用者決定要不要安靜。
+    # 失敗狀態（斷路器暫停、hook 自己出錯、審查沒跑完）不受這個開關影響，
+    # 那些永遠要出聲——「停著」跟「通過」在畫面上長得一模一樣。
+    "remind": True,
     # 這個專案裡不屬於「我」的目錄（相對專案根目錄）。水位線只看 mtime，
     # 分不出是誰改的：同一個工作目錄裡有第二個代理人時，它的改動會被算成
     # 本回合的工作而送去審查——白燒額度，也等於把別人未完成的東西交出去。
@@ -557,6 +567,28 @@ def uninstall_hook(project: Path) -> str:
     write_json(path, settings)
     return (str(project) + "：已移除 " + str(removed) + " 筆。"
             "既有的 session 要重開才會停止觸發。")
+
+
+def as_bool(value, default: bool = False) -> bool:
+    """安全旗標只接受真正的布林語意，不用 truthiness。
+
+    設定檔寫成字串 "false" 時，truthiness 判斷會當成 true——
+    邊界就被靜默打開了，而使用者以為自己關著。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off", ""):
+            return False
+        return default          # 看不懂的字串一律用預設（也就是比較安全的那邊）
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
 
 
 def positive_int(cfg: dict, key: str, minimum: int = 1) -> int:

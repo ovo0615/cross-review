@@ -266,7 +266,9 @@ def main() -> int:
             # 不派工就什麼都不推進——水位線、游標、head_sha、reported_deletions
             # 全部維持原樣，這批改動於是留在累積裡，下一輪繼續被看見。
             common.save_state(project, state)
-            passthrough(dispatch.backlog_note(files, fresh_deletions))
+            # remind=false 時完全安靜：hook 照跑、狀態照維持，只是不出聲。
+            passthrough(dispatch.backlog_note(files, fresh_deletions)
+                        if common.as_bool(cfg.get("remind", True)) else "")
 
     state["reported_deletions"] = sorted(reported | set(fresh_deletions))
 

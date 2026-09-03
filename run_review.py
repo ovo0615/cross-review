@@ -12,6 +12,40 @@ from cross_review.review import main  # noqa: E402
 
 if __name__ == "__main__":
     # `--usage [專案路徑]` 直接印用量彙總，不跑審查。
+    # `--status [專案]` 印出目前累積了多少還沒審查。remind 關掉之後，
+    # 這是使用者主動查「有沒有東西該看」的方式。
+    if len(sys.argv) > 1 and sys.argv[1] == "--status":
+        from cross_review import common, dispatch
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+        target = (Path(sys.argv[2]) if len(sys.argv) > 2 else Path.cwd()).resolve()
+        cfg = common.load_config(target)
+        state = common.load_state(target)
+        _p, _e, files, deleted = dispatch.detect(
+            target, state.get("transcript") or "", int(state.get("cursor", 0)),
+            float(state.get("watermark", 0.0)))
+        print(str(target))
+        print("  觸發模式    " + common.effective_trigger(target, cfg)
+              + "（提醒：" + ("開" if common.as_bool(cfg.get("remind", True))
+                            else "關") + "）")
+        print("  已審到      第 " + str(state.get("round", 0)) + " 輪")
+        n = len(files) + len(deleted)
+        print("  累積未審    " + str(n) + " 個檔案")
+        for f in files[:12]:
+            try:
+                rel = str(Path(f).relative_to(target))
+            except ValueError:
+                rel = str(f)
+            print("     - " + rel)
+        if n > 12:
+            print("     ⋯ 還有 " + str(n - 12) + " 個")
+        note = __import__("cross_review.breaker", fromlist=["x"]).paused_note(target)
+        if note:
+            print("  " + note)
+        sys.exit(0)
+
     # `--install <專案>` / `--uninstall <專案>` 裝上或移除這個專案的 Stop hook。
     if len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall"):
         from cross_review import common
