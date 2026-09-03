@@ -472,6 +472,93 @@ def effective_trigger(project: Path, cfg: dict) -> str:
     return asked if _TRIGGER_RANK[asked] < _TRIGGER_RANK[granted] else granted
 
 
+# ---- Stop hook 的安裝與移除 ----
+#
+# 逐專案安裝而不是裝在全域，是刻意的：材料包送的是**檔案全文**，而這台機器上
+# 有客戶資料。裝在全域等於任何目錄開 session 都會被當成專案——實測餵一個
+# %TEMP% 路徑給 hook，它照樣認成專案、在那裡建出 .claude/review 並要求送審。
+#
+# 「要不要讓這個專案的程式碼出去給第三方模型」應該是一個明確的動作，
+# 而安裝這個 hook 就是那個動作。
+
+def hook_runner() -> Path:
+    """run_hook.py 的實際位置。不寫死路徑，搬家之後仍然對。"""
+    return Path(__file__).resolve().parent.parent / "run_hook.py"
+
+
+def hook_command() -> str:
+    return 'py -3 "' + str(hook_runner()) + '"'
+
+
+def project_settings_path(project: Path) -> Path:
+    return Path(project) / ".claude" / "settings.json"
+
+
+def _load_settings(path: Path) -> dict:
+    data = read_json(path)
+    if data is None and path.exists():
+        raise RuntimeError(str(path) + " 不是合法的 JSON，拒絕覆寫。請先修好它。")
+    if data is not None and not isinstance(data, dict):
+        raise RuntimeError(str(path) + " 的內容不是物件，拒絕覆寫。")
+    return data if isinstance(data, dict) else {}
+
+
+def _has_our_hook(settings: dict) -> bool:
+    for entry in (settings.get("hooks") or {}).get("Stop") or []:
+        for hook in entry.get("hooks") or []:
+            if "run_hook.py" in str(hook.get("command", "")):
+                return True
+    return False
+
+
+def install_hook(project: Path) -> str:
+    """把 Stop hook 裝進這個專案。已經裝過就不重複加。"""
+    project = Path(project).resolve()
+    path = project_settings_path(project)
+    settings = _load_settings(path)
+    if _has_our_hook(settings):
+        return str(project) + "：已經裝過了，沒有重複加。"
+    settings.setdefault("hooks", {}).setdefault("Stop", []).append({
+        "hooks": [{
+            "type": "command",
+            "command": hook_command(),
+            "timeout": 30,
+            "statusMessage": "cross-review：檢查這一輪要不要送審",
+        }]
+    })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, settings)
+    return (str(project) + "：已安裝。新開的 session 就會生效；"
+            "既有的 session 要重開才會載到。")
+
+
+def uninstall_hook(project: Path) -> str:
+    """把 Stop hook 從這個專案移除，其他設定原封不動。"""
+    project = Path(project).resolve()
+    path = project_settings_path(project)
+    if not path.exists():
+        return str(project) + "：本來就沒有裝。"
+    settings = _load_settings(path)
+    kept, removed = [], 0
+    for entry in (settings.get("hooks") or {}).get("Stop") or []:
+        hooks = [h for h in (entry.get("hooks") or [])
+                 if "run_hook.py" not in str(h.get("command", ""))]
+        removed += len(entry.get("hooks") or []) - len(hooks)
+        if hooks:
+            kept.append({**entry, "hooks": hooks})
+    if not removed:
+        return str(project) + "：本來就沒有裝。"
+    if kept:
+        settings["hooks"]["Stop"] = kept
+    else:
+        settings.get("hooks", {}).pop("Stop", None)
+        if not settings.get("hooks"):
+            settings.pop("hooks", None)
+    write_json(path, settings)
+    return (str(project) + "：已移除 " + str(removed) + " 筆。"
+            "既有的 session 要重開才會停止觸發。")
+
+
 def positive_int(cfg: dict, key: str, minimum: int = 1) -> int:
     """讀一個必須是正整數的設定值，壞掉就回退到內建預設。
 

@@ -1345,6 +1345,54 @@ def scenario_trigger_modes(base: Path) -> None:
 
 
 
+def scenario_install(base: Path) -> None:
+    """逐專案安裝／移除 Stop hook。
+
+    逐專案而不是全域，是刻意的：材料包送的是檔案全文，而全域安裝等於任何目錄
+    開 session 都會被當成專案（實測餵一個 %TEMP% 路徑給 hook，它照樣認成專案、
+    在那裡建出 .claude/review 並要求送審）。安裝這個動作本身就是同意。
+    """
+    from cross_review import common as _cm
+    proj = base / "installproj"
+    (proj / ".claude").mkdir(parents=True)
+    settings = proj / ".claude" / "settings.json"
+
+    # 專案本來就有別的設定，不能被蓋掉。
+    settings.write_text(json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}),
+                        encoding="utf-8")
+
+    _cm.install_hook(proj)
+    got = json.loads(settings.read_text(encoding="utf-8"))
+    check("安裝後 hook 在裡面", _cm._has_our_hook(got), got)
+    check("原有的其他設定沒被動到",
+          got.get("permissions", {}).get("allow") == ["Bash(ls:*)"], got)
+
+    msg = _cm.install_hook(proj)
+    n = sum(1 for e in got["hooks"]["Stop"] for h in e["hooks"])
+    again = json.loads(settings.read_text(encoding="utf-8"))
+    n2 = sum(1 for e in again["hooks"]["Stop"] for h in e["hooks"])
+    check("重複安裝不會裝兩次", n == n2 and "已經裝過" in msg, (n, n2, msg))
+
+    _cm.uninstall_hook(proj)
+    after = json.loads(settings.read_text(encoding="utf-8"))
+    check("移除後 hook 不在了", not _cm._has_our_hook(after), after)
+    check("移除後其他設定還在",
+          after.get("permissions", {}).get("allow") == ["Bash(ls:*)"], after)
+    check("重複移除不會報錯", "本來就沒有裝" in _cm.uninstall_hook(proj))
+
+    # 設定檔壞掉時寧可什麼都不做，不要把使用者的設定清掉。
+    settings.write_text('{"permissions":,}', encoding="utf-8")
+    before = settings.read_text(encoding="utf-8")
+    refused = ""
+    try:
+        _cm.install_hook(proj)
+    except RuntimeError as exc:
+        refused = str(exc)
+    check("設定檔壞掉時拒絕安裝", bool(refused), refused[:60])
+    check("壞掉的設定原封不動",
+          settings.read_text(encoding="utf-8") == before)
+
+
 def scenario_generated_files(base: Path) -> None:
     """機器產生的檔案不進材料包。
 
@@ -2114,6 +2162,7 @@ def main() -> int:
         scenario_user_consent(base)
         scenario_manual_gate(base)
         scenario_generated_files(base)
+        scenario_install(base)
         scenario_receipt(base)
         scenario_other_agents_directories(base)
         scenario_referenced_context(base)

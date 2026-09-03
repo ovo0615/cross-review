@@ -12,6 +12,23 @@ from cross_review.review import main  # noqa: E402
 
 if __name__ == "__main__":
     # `--usage [專案路徑]` 直接印用量彙總，不跑審查。
+    # `--install <專案>` / `--uninstall <專案>` 裝上或移除這個專案的 Stop hook。
+    if len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall"):
+        from cross_review import common
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+        target = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.cwd()
+        try:
+            action = (common.install_hook if sys.argv[1] == "--install"
+                      else common.uninstall_hook)
+            print(action(target))
+        except RuntimeError as exc:
+            print("⚠️ " + str(exc))
+            sys.exit(1)
+        sys.exit(0)
+
     # `--now [專案路徑]` 手動送審一次（手動／門檻模式下 hook 不會建工作單）。
     if len(sys.argv) > 1 and sys.argv[1] == "--now":
         from cross_review.review import run_now
