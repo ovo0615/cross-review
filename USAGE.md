@@ -34,6 +34,7 @@ py -3 <工具>\run_review.py --uninstall "<專案>"
 py -3 <工具>\run_review.py --now "<專案>"                  # 送審
 py -3 <工具>\run_review.py --now "<專案>" --mode visual    # 只看畫面
 py -3 <工具>\run_review.py --usage "<專案>"                # 查用量
+py -3 <工具>\run_review.py --status "<專案>"               # 累積了多少沒審
 ```
 
 對 Claude 說「審查」也可以。
@@ -42,7 +43,7 @@ py -3 <工具>\run_review.py --usage "<專案>"                # 查用量
 
 | 模式 | 行為 |
 |---|---|
-| `manual`（預設） | 不自動送，每輪只報累積量 |
+| `manual`（預設） | 不自動送，每輪只報累積量（`"remind": false` 可完全安靜） |
 | `threshold` | 累積 ≥ 10 檔或 ≥ 20 KB 才送 |
 | `auto` | 有改動就送 |
 
@@ -53,6 +54,14 @@ py -3 <工具>\run_review.py --trigger threshold "<專案>"
 **授權寫在 `~/.claude/cross-review.json`，不是專案裡。** 專案的 `trigger` 只能收緊、放不寬——否則 clone 回來的版本庫能自己開啟自動送審。
 
 沒送審的回合什麼都不推進，累積量會一路長大，不會漏。
+
+**想完全安靜**：`config.json` 加 `"remind": false`。hook 照跑、水位線照維持，
+只是不出聲——你要看就 `--status`，要審就說「審查」。**斷路器暫停、hook 出錯、
+審查沒跑完這幾種失敗仍然會出聲**，那些不受這個開關影響。
+
+拿掉 hook 也可以，但會少掉三件事：逐字稿脈絡（審查者看不到你說過什麼）、
+累積機制，以及最要命的——**沒有水位線就只剩 `git status`，而它在 commit 之後
+是乾淨的，等於審不到已經提交的東西**。
 
 `manual` 下 `--now` 會先讀逐字稿：**使用者最近那句話沒有要求審查就拒絕送出**。
 判準是使用者的原話，因為那是執行者唯一偽造不了的東西——只寫「不要自己送審」
